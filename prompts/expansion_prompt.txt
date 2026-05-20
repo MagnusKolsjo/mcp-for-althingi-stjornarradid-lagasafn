@@ -1,0 +1,39 @@
+Þú ert sérfræðingur í íslensku þingmálatali og lagalegri hugtakanotkun — þingstarfið á Alþingi, löggjöf, reglugerðir, réttarfræði, stjórnsýsla og réttarframkvæmd.
+
+Leitarorðið er: {query}
+
+Leitarorðið er skrifað á sænsku eða ensku. Skilaðu 5–10 viðbótarleitarorðum sem auka líkurnar á að finna viðeigandi skjöl í íslenskum heimildum (Alþingi, lagasafn, reglugerd.is, stjornarradid.is).
+
+Reglur:
+- Láttu með íslenskar jafngildar hugtök þar sem þær eru til.
+- Láttu með formlegar lögfræðilegar hugtök, tilvísanir í greinar og titla skjala þar sem við á.
+- Forgangsraðaðu nákvæmum faghugtökum fram yfir almælar orðanotkun.
+- Láttu með þýðingu á sænskum og enskum hugtökum.
+- Notaðu íslenskar skammstafanir þar sem þær eru viðteknar (t.d. gr. = grein, l. = lög).
+
+Skilaðu AÐEINS kommuaðskildum lista án skýringa.
+
+Dæmi:
+  Leitarorð "yttrandefrihet" → tjáningarfrelsi, málfrelsi, frjálsleg tjáning, 73. gr. stjórnarskrár, 10. gr. MSE
+  Leitarorð "miljö" → umhverfismál, loftslagsbreytingar, náttúruvernd, umhverfisvernd, loftslagsmál, losun gróðurhúsalofttegunda, loftslagsstefna
+  Leitarorð "arbetsrätt" → vinnuréttur, vinnumarkaðurinn, kjarasamningur, stéttarfélag, uppsögn, réttindi launamanna, lög um starfsmannaleigur
+  Leitarorð "budget" → fjárlög, fjárhagsáætlun, ríkisfjármál, fjárlagafrumvarp, ríkisútgjöld, fjárveitingar
+  Leitarorð "freedom of expression" → tjáningarfrelsi, málfrelsi, 73. gr. stjórnarskrár, 10. gr. MSE, fjölmiðlafrelsi, pressufrelsið
+  Leitarorð "fiskveiðar" → kvótakerfi, aflaheimildir, fiskveiðistjórnun, úthlutun aflakvóta, auðlindagjald, sjávarútvegur, lög nr. 116/2006
+
+---
+
+Du är expert på isländsk parlamentarisk och juridisk terminologi — þingstarfið á Alþingi, lagstiftning, förordningar (reglugerðir), rättsvetenskap, offentlig förvaltning och rättslig praxis.
+
+Sökordet är: {query}
+
+Sökordet är skrivet på svenska eller engelska. Returnera 5–10 kompletterande sökord som ökar chansen att hitta relevanta dokument i isländska källor (Alþingi XML-API, lagasafn, api.reglugerd.is, stjornarradid.is).
+
+Regler:
+- Inkludera isländska ekvivalenter för alla begrepp.
+- Inkludera officiella juridiska termer, lagparagrafer och dokumenttitlar där relevant.
+- Prioritera precisa facktermer framför generiska ord.
+- Inkludera isländsk översättning av svenska och engelska begrepp.
+- Inkludera varianter med och utan isländska specialtecken (ð→d, þ→th, æ→ae) för robustare sökning.
+
+Returnera KUN en kommaseparerad lista utan förklaringar.

@@ -1,0 +1,40 @@
+# MCP-server för isländsk riksdags- och rättsdata
+# Installera: pip install -r requirements.txt
+
+# MCP-server
+mcp>=1.0.0
+
+# HTTP-anrop mot Alþingi XML-API och stjornarradid.is
+httpx>=0.27.0
+
+# curl_cffi — Chrome TLS-fingerprint för att passera Cloudflare bot-shield på althingi.is
+curl_cffi>=0.7.0
+
+# XML-parsning (Alþingi XML-API)
+lxml>=5.0.0
+
+# Konfiguration via .env
+python-dotenv>=1.0.0
+
+# Databas — välj ett:
+# Alternativ A: PostgreSQL + pgvector (primär, rekommenderas — krävs för semantisk sökning)
+psycopg2-binary>=2.9.0
+# Alternativ B: SQLite (ingen serverinstallation)
+# sqlite-vec installeras separat: pip install sqlite-vec
+
+# HTTP-transport (krävs för MCP_TRANSPORT=http)
+starlette>=0.40.0
+uvicorn>=0.30.0
+
+# --- Lagasafn bulk-ZIP + reglugerd.is ---
+# Inga extra paket utöver httpx — ZIP-hantering via stdlib (zipfile)
+
+# --- Rit og skýrslur PDF-pipeline ---
+pymupdf4llm>=0.0.17
+
+# --- RAG + termexpansion ---
+# intfloat/multilingual-e5-base — bästa tillgängliga för isländska (768 dim)
+sentence-transformers>=3.0.0
+
+# Query-expansion via OpenAI-kompatibel endpoint (valfritt)
+openai>=1.0.0

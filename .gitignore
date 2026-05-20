@@ -1,0 +1,25 @@
+# SQLite-databas
+island_cache.db
+island_cache.db-wal
+island_cache.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# FUSE-temporärfiler
+.fuse_hidden*
+
+# Loggar (genereras av synk_daglig.sh)
+logs/
+
+# Miljövariabler — ska aldrig checkas in
+.env
+
+# Engångsskript och diagnostikverktyg
+test_embedding.py
+diagnoser/

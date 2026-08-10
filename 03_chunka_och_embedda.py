@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Magnus Kolsjö
 
 """
-03_chunka_och_embedda.py — Chunkning och embedding för arbetsström 16 (Island)
+03_chunka_och_embedda.py — Chunkning och embedding för isländsk riksdags- och rättsdata
 
 Läser fulltext_md från island.dokument (þingskjöl, lög, reglugerðir) och
 island.dokument_rit (rit og skýrslur), delar upp i stycken och genererar

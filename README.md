@@ -160,6 +160,24 @@ ALTHINGI_USER_AGENT=<Safaris exakta User-Agent>
 i `.env`. Klienten väljer då Safari-fingerprint automatiskt. Lyckas inte
 universellt — fungerar i vissa konfigurationer.
 
+
+## Svarsstorlek och trunkering
+
+MCP-protokollet har en övre storleksgräns per svar. Den största publikationen i cachen är **528 278 tecken**.
+`is_hamta_skyrsla` och `is_hamta_log` tar därför två parametrar:
+
+| Parameter | Innebörd |
+|---|---|
+| `max_tecken` | Teckentak för texten. Standard 60 000 tecken; `0` ger hela texten som ett uttryckligt val. |
+| `fran_tecken` | Börja vid denna teckenposition — för att läsa vidare där ett kapat svar slutade. |
+
+Ett kapat svar säger alltid ifrån med fälten `trunkerad`, `tecken_totalt`, `tecken_visade` och `fortsatt_fran_tecken`. Kapningen sker på ordgräns, aldrig mitt i
+ett ord.
+
+**Vid ordagranna citat:** citera aldrig ur ett svar som är markerat som kapat.
+Läs vidare med `fran_tecken` tills hela passagen är hämtad. Standardvärdet kan
+sättas i `.env` med `IS_MAX_TECKEN`.
+
 ## Licens
 
 GNU Affero General Public License v3.0 (AGPL-3.0). Se `LICENSE` i repots rot

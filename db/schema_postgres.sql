@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS island.dokument_rit (
     -- Direkt PDF-länk (från /library/-lagret på stjornarradid.is)
     pdf_url            TEXT,
 
-    -- Fulltext extraherad från PDF (pymupdf4llm), raderas ej (skillnad från ström 9)
+    -- Fulltext extraherad från PDF (pymupdf4llm), raderas ej
     -- Nyckeln är att vi inte cachelagrar PDF-filen — bara extraherad text
     fulltext_md        TEXT,
 

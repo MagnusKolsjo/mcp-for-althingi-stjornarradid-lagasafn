@@ -85,6 +85,43 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Standardtak för fulltext i hämtverktygen. Isländska skýrslur och lagtexter når över en halv miljon tecken
+# och kan överskrida MCP-protokollets storleksgräns, vilket får anropet att
+# misslyckas helt. Anroparen kan höja taket eller sätta 0 för hela texten.
+IS_MAX_TECKEN = int(os.getenv("IS_MAX_TECKEN", "60000"))
+
+def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
+    """
+    Skär ut ett textutdrag och redovisa alltid vad som kapats.
+
+    Trunkering utan markering är ett tyst datafel — svaret ser ut att vara hela
+    innehållet. max_tecken <= 0 betyder ingen trunkering. Klipper på ordgräns.
+    """
+    text   = text or ""
+    totalt = len(text)
+    start  = max(0, min(fran_tecken, totalt))
+    rest   = text[start:]
+
+    if max_tecken and max_tecken > 0 and len(rest) > max_tecken:
+        utdrag    = rest[:max_tecken]
+        brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
+        if brytpunkt > max_tecken * 0.6:
+            utdrag = utdrag[:brytpunkt]
+        utdrag    = utdrag.rstrip()
+        trunkerad = True
+    else:
+        utdrag    = rest
+        trunkerad = False
+
+    slut = start + len(utdrag)
+    return {
+        "text":                 utdrag,
+        "tecken_totalt":        totalt,
+        "tecken_visade":        len(utdrag),
+        "trunkerad":            trunkerad,
+        "fortsatt_fran_tecken": slut if slut < totalt else None,
+    }
+
 # ── MCP-server ─────────────────────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -412,6 +449,8 @@ def _parse_beteckning(s: str) -> tuple[int, int]:
 def is_hamta_log(
     beteckning: str,
     version: str = "nuna",
+    max_tecken: int = IS_MAX_TECKEN,
+    fran_tecken: int = 0,
 ) -> dict:
     """
     Hämtar en konsoliderad isländsk lag från althingi.is/lagasafn/.
@@ -452,6 +491,17 @@ def is_hamta_log(
                 "tips":       "Verifiera lagnummer och år mot listan på althingi.is/lagasafn/. "
                               "För semantisk sökning i lagtexter, använd is_sok_i_dokument.",
             }
+
+        # Källan levererar alltid hela lagtexten — trunkeringen gäller bara svaret.
+        for nyckel in ("fulltext_md", "text", "lagtext"):
+            if result.get(nyckel):
+                _u = _skar_ut(result[nyckel], max_tecken, fran_tecken)
+                result[nyckel]                = _u["text"]
+                result["tecken_totalt"]        = _u["tecken_totalt"]
+                result["tecken_visade"]        = _u["tecken_visade"]
+                result["trunkerad"]            = _u["trunkerad"]
+                result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
+                break
         return result
     except HamtaFel as exc:
         if exc.reason == "404":
@@ -652,7 +702,11 @@ def is_sok_skyrslur(
 
 
 @mcp.tool()
-def is_hamta_skyrsla(url: str) -> dict:
+def is_hamta_skyrsla(
+    url: str,
+    max_tecken: int = IS_MAX_TECKEN,
+    fran_tecken: int = 0,
+) -> dict:
     """
     Hämtar fulltext för en isländsk regeringspublikation (rit og skýrslur).
 
@@ -677,8 +731,14 @@ def is_hamta_skyrsla(url: str) -> dict:
         # Strategi 1: returnera från DB-cache om fulltext redan finns
         cached = _hamta_rit_fra_db(url)
         if cached and cached.get("fulltext_md"):
-            cached["kalla"]       = "db_cache"
-            cached["tecken_antal"] = len(cached["fulltext_md"])
+            cached["kalla"] = "db_cache"
+            # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
+            _u = _skar_ut(cached["fulltext_md"], max_tecken, fran_tecken)
+            cached["fulltext_md"]          = _u["text"]
+            cached["tecken_antal"]         = _u["tecken_visade"]
+            cached["tecken_totalt"]        = _u["tecken_totalt"]
+            cached["trunkerad"]            = _u["trunkerad"]
+            cached["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
             return cached
 
         # Strategi 2: hämta live (PDF → markdown)
@@ -714,6 +774,14 @@ def is_hamta_skyrsla(url: str) -> dict:
             except Exception as exc:
                 log.debug("DB-cache för %s misslyckades (icke-kritiskt): %s",
                           url, exc)
+
+        if result.get("fulltext_md"):
+            _u = _skar_ut(result["fulltext_md"], max_tecken, fran_tecken)
+            result["fulltext_md"]          = _u["text"]
+            result["tecken_antal"]         = _u["tecken_visade"]
+            result["tecken_totalt"]        = _u["tecken_totalt"]
+            result["trunkerad"]            = _u["trunkerad"]
+            result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
 
         return result
 

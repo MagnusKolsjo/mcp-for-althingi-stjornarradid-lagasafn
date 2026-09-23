@@ -214,15 +214,15 @@ Stjórnartíðindi (`"originalkungorelse"`), annars `null`.
 
 ## Svarsstorlek och trunkering
 
-MCP-protokollet har en övre storleksgräns per svar. Den största publikationen i cachen är **528 278 tecken**.
+MCP-protokollet har en övre storleksgräns per svar. Den största publikationen i cachen är **1 301 674 tecken** och den största lagen 244 268.
 `is_hamta_skyrsla` och `is_hamta_log` tar därför två parametrar:
 
 | Parameter | Innebörd |
 |---|---|
-| `max_tecken` | Teckentak för texten. Standard 60 000 tecken; `0` ger hela texten som ett uttryckligt val. |
+| `max_tecken` | Teckentak för texten. Standard 60 000 tecken; `0` ger så mycket som ryms. Högst 200 000 tecken per anrop, eftersom svaret skickas två gånger (text och struktur) och ska hålla sig under 1 MB. |
 | `fran_tecken` | Börja vid denna teckenposition — för att läsa vidare där ett kapat svar slutade. |
 
-Ett kapat svar säger alltid ifrån med fälten `trunkerad`, `tecken_totalt`, `tecken_visade` och `fortsatt_fran_tecken`. Kapningen sker på ordgräns, aldrig mitt i
+Ett kapat svar säger alltid ifrån med fälten `trunkerad`, `tecken_totalt`, `tecken_visade` och `fortsatt_fran_tecken`, som anger utdragets faktiska slut. `las_vidare` är det kompletta anropet för nästa utdrag. Kapningen sker på ordgräns, aldrig mitt i
 ett ord.
 
 **Vid ordagranna citat:** citera aldrig ur ett svar som är markerat som kapat.

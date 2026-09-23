@@ -93,27 +93,43 @@ log = logging.getLogger(__name__)
 
 # Standardtak för fulltext i hämtverktygen. Isländska skýrslur och lagtexter når över en halv miljon tecken
 # och kan överskrida MCP-protokollets storleksgräns, vilket får anropet att
-# misslyckas helt. Anroparen kan höja taket eller sätta 0 för hela texten.
+# misslyckas helt. Anroparen kan höja taket upp till IS_MAX_TECKEN_TAK.
 IS_MAX_TECKEN = int(os.getenv("IS_MAX_TECKEN", "60000"))
+
+# Övre tak per svar, även med max_tecken=0. Svaret skickas två gånger (text
+# och structuredContent); 200 000 tecken ger omkring 0,5 MB och håller sig
+# under MCP-klienternas gräns på 1 MB. Den största publikationen är över
+# 1,3 miljoner tecken och läses därför i flera anrop.
+IS_MAX_TECKEN_TAK = 200_000
+
 
 def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
     """
     Skär ut ett textutdrag och redovisa alltid vad som kapats.
 
     Trunkering utan markering är ett tyst datafel — svaret ser ut att vara hela
-    innehållet. max_tecken <= 0 betyder ingen trunkering. Klipper på ordgräns.
+    innehållet. max_tecken <= 0 betyder "så mycket som möjligt", men aldrig
+    mer än IS_MAX_TECKEN_TAK. Klipper på ordgräns.
+
+    fortsatt_fran_tecken är utdragets faktiska slut. Kapningen på ordgräns gör
+    utdraget kortare än taket; en fortsättning vid fran_tecken + max_tecken
+    skulle hoppa över det avkapade ordet.
     """
+    if not max_tecken or max_tecken <= 0 or max_tecken > IS_MAX_TECKEN_TAK:
+        max_tecken = IS_MAX_TECKEN_TAK
     text   = text or ""
     totalt = len(text)
     start  = max(0, min(fran_tecken, totalt))
     rest   = text[start:]
 
-    if max_tecken and max_tecken > 0 and len(rest) > max_tecken:
+    if len(rest) > max_tecken:
         utdrag    = rest[:max_tecken]
         brytpunkt = max(utdrag.rfind(" "), utdrag.rfind("\n"))
         if brytpunkt > max_tecken * 0.6:
             utdrag = utdrag[:brytpunkt]
-        utdrag    = utdrag.rstrip()
+        # Ett utdrag av bara blanktecken skulle ge slut == start, och
+        # fortsättningen skulle peka på samma ställe igen.
+        utdrag    = utdrag.rstrip() or rest[:max_tecken]
         trunkerad = True
     else:
         utdrag    = rest
@@ -126,7 +142,18 @@ def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
         "tecken_visade":        len(utdrag),
         "trunkerad":            trunkerad,
         "fortsatt_fran_tecken": slut if slut < totalt else None,
+        "max_tecken":           max_tecken,
     }
+
+
+def _las_vidare(verktyg: str, nyckel: str, varde: str, max_tecken: int,
+                slut: Optional[int], extra: str = "") -> Optional[str]:
+    """Läs-vidare-raden som ett komplett anrop, eller None för sista utdraget."""
+    if slut is None:
+        return None
+    return (f'Läs vidare: {verktyg}({nyckel}="{varde}"{extra}, '
+            f"max_tecken={max_tecken}, fran_tecken={slut})")
+
 
 # ── MCP-server ─────────────────────────────────────────────────────────────────
 
@@ -481,14 +508,16 @@ def is_hamta_log(
                     `beteckning` från is_sok_i_dokument-träffar.
       version     — 'nuna' (gällande version, standard) eller riksmötessuffix
                     som '157a', '156b', '155', '154a'.
-      max_tecken  — Teckentak för lagtexten (standard 60 000). 0 = hela texten.
+      max_tecken  — Teckentak för lagtexten (standard 60 000). 0 = så mycket
+                    som ryms, högst 200 000 tecken per anrop.
       fran_tecken — Börja vid denna position, för att läsa vidare efter ett
                     kapat svar (se fortsatt_fran_tecken).
 
     Returnerar:
       nr, ar, version, beteckning (t.ex. '33/1944'), titill,
       fulltext_md (lagtext i markdown), url, tecken_antal, samt
-      tecken_totalt, tecken_visade, trunkerad, fortsatt_fran_tecken.
+      tecken_totalt, tecken_visade, trunkerad, fortsatt_fran_tecken och
+      las_vidare (komplett anrop för nästa utdrag, null i sista utdraget).
     Ger ett fel om lagen inte hittas eller beteckningen är ogiltig.
 
     Exempel: is_hamta_log(beteckning="33/1944") → Stjórnarskrá (grundlagen)
@@ -519,6 +548,11 @@ def is_hamta_log(
             result["tecken_visade"]        = _u["tecken_visade"]
             result["trunkerad"]            = _u["trunkerad"]
             result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
+            result["las_vidare"] = _las_vidare(
+                "is_hamta_log", "beteckning", f"{nr}/{ar}", _u["max_tecken"],
+                _u["fortsatt_fran_tecken"],
+                "" if version == "nuna" else f', version="{version}"',
+            )
             break
     return result
 
@@ -651,6 +685,10 @@ def _trunkera_rit(post: dict, max_tecken: int, fran_tecken: int) -> dict:
     post["tecken_totalt"]        = _u["tecken_totalt"]
     post["trunkerad"]            = _u["trunkerad"]
     post["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
+    post["las_vidare"] = _las_vidare(
+        "is_hamta_skyrsla", "url", post.get("url") or "", _u["max_tecken"],
+        _u["fortsatt_fran_tecken"],
+    )
     return post
 
 
@@ -737,13 +775,15 @@ def is_hamta_skyrsla(
                     'https://www.stjornarradid.is/gogn/rit-og-skyrslur/rit/2024-12-12-Endurskodun-a-logum-um-rammaaaetlun-Skyrsla-starfshops/'
                     Äldre /stakt-rit/-URL:er och /rit/YYYY/MM/DD/-formen tas
                     också emot.
-      max_tecken  — Teckentak för texten (standard 60 000). 0 = hela texten.
+      max_tecken  — Teckentak för texten (standard 60 000). 0 = så mycket som
+                    ryms, högst 200 000 tecken per anrop.
       fran_tecken — Börja vid denna position, för att läsa vidare efter ett
                     kapat svar (se fortsatt_fran_tecken).
 
     Returnerar:
       url, titill, pdf_url, fulltext_md (markdown), tecken_antal,
-      tecken_totalt, trunkerad, fortsatt_fran_tecken, kalla ('db_cache' | 'live').
+      tecken_totalt, trunkerad, fortsatt_fran_tecken, las_vidare (komplett
+      anrop för nästa utdrag, null i sista utdraget), kalla ('db_cache' | 'live').
       Ger ett fel om publikationen, PDF:en eller texten inte går att hämta.
 
     PDF-filen lagras INTE lokalt — den laddas ned, extraheras och raderas direkt.

@@ -17,6 +17,12 @@ tillämpar [Semantic Versioning](https://semver.org/).
   uppstarten med exitkod 2 i stället för att servern startar oskyddad.
   Saknad `Authorization`-header ger 401, fel nyckel 403. http-läget
   (Streamable HTTP på `/mcp`, port 8006) startade inte alls tidigare.
+- **Brytande:** `max_tecken` i `is_hamta_log` och `is_hamta_skyrsla` har ett
+  övre tak på 200 000 tecken per anrop, även med `max_tecken=0` (som tidigare
+  gav hela texten). Den största publikationen är över 1,3 miljoner tecken, och
+  svaret skickas både som text och struktur; utan tak blev det långt över
+  1 MB. Kapade svar har fältet `las_vidare` med det kompletta anropet för
+  nästa utdrag.
 - **Brytande:** förväntade fel (okänd beteckning, okänt þing, dokument som
   inte finns, källan svarar inte, databasen nere) ges som MCP-fel med
   `isError` och ett svenskt meddelande, i stället för ett svar med

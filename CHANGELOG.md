@@ -75,6 +75,12 @@ tillämpar [Semantic Versioning](https://semver.org/).
   30 (`perPage` ignoreras av källan).
 - `is_sok_i_dokument` svarade med tomma träfflistor när Postgres var nere.
   Databasfel ger nu ett MCP-fel med orsaken.
+- Crawl-delay på 5 s mot althingi.is hölls inte: hinken räknade väntetiden
+  som förbrukad innan väntan var slut, så samtidiga anrop kunde gå iväg
+  tätare, och althingi.py och lagasafn.py hade var sin hink mot samma värd.
+  En gemensam strypning per värd (`takt.py`) reserverar nu varje starttid
+  under lås och håller anropen minst 5 s isär, även mellan modulerna.
+  curl_cffi och User-Agent-hanteringen är oförändrade.
 - `--help` och okända flaggor till `stjornarradid_rit.py`,
   `01_synka_lagasafn.py`, `02_synka_reglugerd.py` och `mcp_server.py` startade
   synken respektive servern. Argumenten tolkas nu med argparse innan något

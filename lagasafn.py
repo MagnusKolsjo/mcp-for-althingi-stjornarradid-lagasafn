@@ -30,8 +30,6 @@ User-Agent: mcp-for-althingi-stjornarradid-lagasafn/1.0 (krävs — 403 utan).
 import logging
 import os
 import re
-import threading
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +37,7 @@ from curl_cffi import requests as cf_requests
 from dotenv import load_dotenv
 from lxml import html as lhtml
 
+import takt
 from klient_fel import HamtaFel
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -84,11 +83,6 @@ def _cookies() -> dict:
     """Returnerar cookies-dict med cf_clearance om värdet är satt, annars tom dict."""
     return {"cf_clearance": ALTHINGI_CF_CLEARANCE} if ALTHINGI_CF_CLEARANCE else {}
 
-# Token-bucket för crawl-delay (separat från althingi.py)
-_bucket_tokens  = 1.0
-_bucket_last_ts = time.monotonic()
-_takt_las       = threading.Lock()
-
 
 # ---------------------------------------------------------------------------
 # Internverktyg
@@ -96,25 +90,12 @@ _takt_las       = threading.Lock()
 
 def _throttle():
     """
-    Respekterar Crawl-delay: 5 via token-bucket.
+    Respekterar Crawl-delay: 5 mot althingi.is.
 
-    Verktygen körs på arbetstrådar. Låset gör läsning och uppdatering av
-    hinken atomär, och väntan inne i låset håller takten även när flera
-    anrop pågår samtidigt.
+    Strypningen delas med de andra modulerna som anropar althingi.is (se
+    takt.py), eftersom Crawl-delay gäller värden och inte modulen.
     """
-    global _bucket_tokens, _bucket_last_ts
-    with _takt_las:
-        now    = time.monotonic()
-        elapsed = now - _bucket_last_ts
-        _bucket_tokens  = min(1.0, _bucket_tokens + elapsed / CRAWL_DELAY)
-        _bucket_last_ts = now
-        if _bucket_tokens < 1.0:
-            sleep_s = (1.0 - _bucket_tokens) * CRAWL_DELAY
-            log.debug("Crawl-delay lagasafn: väntar %.1f s", sleep_s)
-            time.sleep(sleep_s)
-            _bucket_tokens = 0.0
-        else:
-            _bucket_tokens -= 1.0
+    takt.vanta("althingi.is", CRAWL_DELAY)
 
 
 def _lag_url(nr: int, ar: int, version: str = "nuna") -> str:

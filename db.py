@@ -68,7 +68,11 @@ def _hamta_db():
             ) from exc
         return psycopg2.connect(DATABASE_URL)
 
-    sokvag = urlparse(DATABASE_URL).path.lstrip("/")
+    # sqlite:///relativ.db ger sökvägen "/relativ.db" och sqlite:////abs/fil.db
+    # ger "//abs/fil.db". Bara det första snedstrecket hör till URL-syntaxen.
+    sokvag = urlparse(DATABASE_URL).path
+    if sokvag.startswith("/"):
+        sokvag = sokvag[1:]
     if not sokvag:
         raise RuntimeError("DATABASE_URL för SQLite saknar filsökväg")
     conn = sqlite3.connect(sokvag, check_same_thread=False)
@@ -97,7 +101,7 @@ def initiera_schema():
     Säker att köra många gånger — schemat är idempotent.
 
     Loggar varning och returnerar utan att kasta om DB är otillgänglig,
-    så att MCP-servern står kvar i Claude Desktop även när Postgres-containern
+    så att MCP-servern står kvar i MCP-klienten även när Postgres-containern
     är nere. Verktygsanrop felar i så fall tills DB kommer upp igen.
     """
     if not DATABASE_URL:

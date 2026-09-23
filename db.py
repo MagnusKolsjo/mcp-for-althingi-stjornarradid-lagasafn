@@ -477,16 +477,29 @@ def upsert_dokument_rit(
     pdf_url: Optional[str],
     fulltext_md: Optional[str] = None,
 ) -> str:
-    """Infogar eller uppdaterar en post i dokument_rit. Returnerar url (PK)."""
+    """
+    Infogar eller uppdaterar en post i dokument_rit. Returnerar url (PK).
+
+    Metadatasynken skickar pdf_url och fulltext_md som None. Vid konflikt
+    behålls därför redan lagrade värden i alla fält där det nya är tomt;
+    annars skulle varje synk radera extraherad fulltext.
+    """
     if _ar_postgres():
         sql = """
-            INSERT INTO island.dokument_rit
+            INSERT INTO island.dokument_rit AS r
                 (url, titill, slug, dagsetning, ministerium, tema, ar,
                  dokumenttyp_isl, pdf_url, fulltext_md, cachad_vid)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (url) DO UPDATE SET
                 titill          = EXCLUDED.titill,
-                fulltext_md     = EXCLUDED.fulltext_md,
+                slug            = COALESCE(EXCLUDED.slug,            r.slug),
+                dagsetning      = COALESCE(EXCLUDED.dagsetning,      r.dagsetning),
+                ministerium     = COALESCE(EXCLUDED.ministerium,     r.ministerium),
+                tema            = COALESCE(EXCLUDED.tema,            r.tema),
+                ar              = COALESCE(EXCLUDED.ar,              r.ar),
+                dokumenttyp_isl = COALESCE(EXCLUDED.dokumenttyp_isl, r.dokumenttyp_isl),
+                pdf_url         = COALESCE(EXCLUDED.pdf_url,         r.pdf_url),
+                fulltext_md     = COALESCE(EXCLUDED.fulltext_md,     r.fulltext_md),
                 cachad_vid      = NOW()
         """
     else:
@@ -496,15 +509,109 @@ def upsert_dokument_rit(
                  dokumenttyp_isl, pdf_url, fulltext_md)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (url) DO UPDATE SET
-                titill      = excluded.titill,
-                fulltext_md = excluded.fulltext_md,
-                cachad_vid  = datetime('now')
+                titill          = excluded.titill,
+                slug            = COALESCE(excluded.slug,            dokument_rit.slug),
+                dagsetning      = COALESCE(excluded.dagsetning,      dokument_rit.dagsetning),
+                ministerium     = COALESCE(excluded.ministerium,     dokument_rit.ministerium),
+                tema            = COALESCE(excluded.tema,            dokument_rit.tema),
+                ar              = COALESCE(excluded.ar,              dokument_rit.ar),
+                dokumenttyp_isl = COALESCE(excluded.dokumenttyp_isl, dokument_rit.dokumenttyp_isl),
+                pdf_url         = COALESCE(excluded.pdf_url,         dokument_rit.pdf_url),
+                fulltext_md     = COALESCE(excluded.fulltext_md,     dokument_rit.fulltext_md),
+                cachad_vid      = datetime('now')
         """
 
     with _cursor() as cur:
         cur.execute(sql, (url, titill, slug, dagsetning, ministerium, tema, ar,
                           dokumenttyp_isl, pdf_url, fulltext_md))
     return url
+
+
+_RIT_KOLUMNER = ("url", "titill", "slug", "dagsetning", "ministerium", "tema",
+                 "ar", "dokumenttyp_isl", "pdf_url", "fulltext_md")
+
+
+def hamta_dokument_rit(url: str) -> Optional[dict]:
+    """Returnerar posten i dokument_rit med given url, eller None."""
+    sql = (f"SELECT {', '.join(_RIT_KOLUMNER)} FROM {_prefix()}dokument_rit "
+           f"WHERE url = {_ph()}")
+    with _cursor() as cur:
+        cur.execute(sql, (url,))
+        rad = cur.fetchone()
+    if not rad:
+        return None
+    post = dict(zip(_RIT_KOLUMNER, rad))
+    if post["dagsetning"] is not None:
+        post["dagsetning"] = str(post["dagsetning"])
+    return post
+
+
+def lista_rit_urler_med_monster(monster: str) -> list[str]:
+    """Returnerar url för alla poster i dokument_rit som matchar LIKE-mönstret."""
+    sql = f"SELECT url FROM {_prefix()}dokument_rit WHERE url LIKE {_ph()} ORDER BY url"
+    with _cursor() as cur:
+        cur.execute(sql, (monster,))
+        return [r[0] for r in cur.fetchall()]
+
+
+def flytta_dokument_rit(gammal_url: str, ny_url: str, ny_slug: str) -> str:
+    """
+    Flyttar en post i dokument_rit från gammal_url till ny_url, i en transaktion.
+
+    Finns ingen post med ny_url kopieras den gamla dit med ny url och slug.
+    Finns en sådan redan (en synk har hunnit lägga in publikationen under den
+    nya URL:en) slås posterna ihop: den nya postens värden behålls och tomma
+    fält fylls från den gamla. Den gamla postens chunks flyttas med om den nya
+    posten saknar chunks, annars tas de bort. Sist raderas den gamla posten.
+
+    chunks_rit.dok_url pekar på url utan ON UPDATE CASCADE, därför görs
+    flytten som kopiera–flytta chunks–radera i stället för en UPDATE av nyckeln.
+
+    Returnerar 'flyttad' eller 'sammanslagen'. Är gammal_url och ny_url samma,
+    eller saknas den gamla posten, returneras 'flyttad' utan ändring.
+    """
+    if gammal_url == ny_url:
+        return "flyttad"
+    p, ph = _prefix(), _ph()
+    ovriga = [k for k in _RIT_KOLUMNER if k not in ("url", "slug")] + [
+        "pdf_extraherad_at", "sync_status", "cachad_vid"]
+
+    with _cursor() as cur:
+        cur.execute(f"SELECT 1 FROM {p}dokument_rit WHERE url = {ph}", (gammal_url,))
+        if cur.fetchone() is None:
+            return "flyttad"
+        cur.execute(f"SELECT 1 FROM {p}dokument_rit WHERE url = {ph}", (ny_url,))
+        finns_redan = cur.fetchone() is not None
+
+        if not finns_redan:
+            cur.execute(
+                f"INSERT INTO {p}dokument_rit (url, slug, {', '.join(ovriga)}) "
+                f"SELECT {ph}, {ph}, {', '.join(ovriga)} FROM {p}dokument_rit "
+                f"WHERE url = {ph}",
+                (ny_url, ny_slug, gammal_url),
+            )
+            utfall = "flyttad"
+        else:
+            fyll = ", ".join(
+                f"{k} = COALESCE({p}dokument_rit.{k}, "
+                f"(SELECT g.{k} FROM {p}dokument_rit g WHERE g.url = {ph}))"
+                for k in ovriga if k != "cachad_vid"
+            )
+            cur.execute(
+                f"UPDATE {p}dokument_rit SET {fyll} WHERE url = {ph}",
+                tuple([gammal_url] * (len(ovriga) - 1)) + (ny_url,),
+            )
+            utfall = "sammanslagen"
+
+        cur.execute(f"SELECT 1 FROM {p}chunks_rit WHERE dok_url = {ph} LIMIT 1", (ny_url,))
+        if cur.fetchone() is None:
+            cur.execute(f"UPDATE {p}chunks_rit SET dok_url = {ph} WHERE dok_url = {ph}",
+                        (ny_url, gammal_url))
+        else:
+            cur.execute(f"DELETE FROM {p}chunks_rit WHERE dok_url = {ph}", (gammal_url,))
+
+        cur.execute(f"DELETE FROM {p}dokument_rit WHERE url = {ph}", (gammal_url,))
+    return utfall
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,8 @@ tillämpar [Semantic Versioning](https://semver.org/).
   PDF-länkar.
 - `is_sok_reglugerd` räknar om sidindelningen efter källans fasta sidstorlek
   30 (`perPage` ignoreras av källan).
+- `is_sok_i_dokument` svarade med tomma träfflistor när Postgres var nere.
+  Databasfel ger nu ett MCP-fel med orsaken.
 - Absoluta SQLite-sökvägar (`sqlite:////abs/fil.db`) tolkades som relativa.
 - En tom rit-listning ger exitkod 1 i stället för att synken tyst lyckas.
 

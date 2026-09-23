@@ -887,7 +887,8 @@ def is_sok_i_dokument(
         log.error("is_sok_i_dokument misslyckades ('%s'): %s", fraga, exc)
         raise ToolError(
             "Sökningen misslyckades. Kontrollera att databasen är igång och "
-            f"att embeddingmodellen går att läsa in ({type(exc).__name__})."
+            f"att embeddingmodellen går att läsa in ({type(exc).__name__}: "
+            f"{str(exc).strip()[:200]})."
         )
 
     return {

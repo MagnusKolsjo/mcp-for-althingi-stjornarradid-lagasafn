@@ -688,7 +688,7 @@ def vektor_sok(
     """
     Semantisk sökning via pgvector (cosinuslikhet).
     tabell: 'chunks' (þingskjöl/lög/regl.) eller 'chunks_rit' (rit og skýrslur).
-    Kräver PostgreSQL — returnerar tom lista vid SQLite.
+    Kräver PostgreSQL — returnerar tom lista vid SQLite. Databasfel kastas.
     """
     if not _ar_postgres():
         log.warning("vektor_sok: pgvector kräver PostgreSQL.")
@@ -715,14 +715,12 @@ def vektor_sok(
         LIMIT  %s
     """
 
-    try:
-        with _cursor() as cur:
-            cur.execute(sql, [vec_str, vec_str, max_treff])
-            rader = cur.fetchall()
-            kolumner = [c[0] for c in (cur.description or [])]
-    except Exception as exc:
-        log.error("vektor_sok misslyckades: %s", exc)
-        return []
+    # Databasfel kastas vidare: en tom lista skulle se ut som "inga träffar"
+    # när Postgres i själva verket är nere.
+    with _cursor() as cur:
+        cur.execute(sql, [vec_str, vec_str, max_treff])
+        rader = cur.fetchall()
+        kolumner = [c[0] for c in (cur.description or [])]
 
     return [
         {

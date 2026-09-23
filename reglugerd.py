@@ -16,7 +16,8 @@ Bekräftade endpoints:
   GET /api/v1/ministries                         — lista 16 ministerier
   GET /api/v1/search                             — sökning, paginerat JSON
   GET /api/v1/regulation/{nr-ar}/{version}/      — metadata för en förordning
-  GET /api/v1/regulation/{nr-ar}/{version}/pdf/  — PDF-fulltext
+  GET /api/v1/regulation/{nr-ar}/{version}/pdf/  — PDF-fulltext (bara för
+      förordningar vars detaljsvar har pdfVersion; övriga ger 404)
 
 Sökresultat-format (verifierat):
   {
@@ -24,6 +25,11 @@ Sökresultat-format (verifierat):
     "data": [{"name": "1424/2020", "title": "...", "publishedDate": "2020-12-30",
               "ministry": "Umhverfis-, orku- og loftslagsráðuneyti"}, ...]
   }
+  perPage ignoreras (alltid 30). Utan både q och year blir träffarna 0.
+  I detaljsvaret är ministry i stället ett objekt {slug, name}, eller saknas.
+
+Detaljsvaret finns i två former: fullständigt (med pdfVersion) eller ett
+kortsvar {name, title, redirectUrl, originalDoc} — se hamta_reglugerd().
 
 URL-format för enskilda förordningar:
   {nr-ar} = nummer-år, ex. '0179-2018' (nr 179/2018, nr paddas till 4 siffror)
@@ -102,8 +108,36 @@ def hamta_ministerier() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Hjälpare för källans fältformat
+# ---------------------------------------------------------------------------
+
+# Källan returnerar alltid 30 poster per sida; perPage ignoreras.
+API_SIDSTORLEK = 30
+
+
+def ministerium_namn(varde) -> str:
+    """
+    Returnerar ministeriets namn oavsett format. Sökresultaten har en sträng,
+    detaljsvaret ett objekt {slug, name}, och fältet kan saknas helt.
+    """
+    if isinstance(varde, dict):
+        return str(varde.get("name") or varde.get("slug") or "")
+    return str(varde or "")
+
+
+# ---------------------------------------------------------------------------
 # Sökning
 # ---------------------------------------------------------------------------
+
+def _sok_sida(fraga: str, ar: Optional[int], api_sida: int) -> dict:
+    params: dict = {"page": api_sida}
+    if fraga:
+        params["q"] = fraga
+    if ar is not None:
+        params["year"] = ar
+    svar = _get("search", params=params)
+    return svar if isinstance(svar, dict) else {}
+
 
 def sok_reglugerd(
     fraga: str = "",
@@ -114,119 +148,148 @@ def sok_reglugerd(
     """
     Söker i isländska förordningar via /api/v1/search.
 
+    Källan har en fast sidstorlek på 30 och ignorerar perPage. Sidindelningen
+    här räknas därför om: sida `page` med `per_page` poster motsvarar poster
+    (page-1)*per_page … page*per_page-1, som hämtas från de en eller två
+    källsidor de ligger på. per_page begränsas till 1–30.
+
+    Källan ger 0 träffar när både fritext och år saknas, så minst ett av dem
+    krävs (ValueError annars).
+
     Parametrar:
       fraga    — Fritext på isländska (söker i titel och innehåll).
-                 Tom sträng returnerar alla förordningar (paginerat).
-      ar       — Filtrera på publiceringsår (t.ex. 2020). Inget filter om None.
-      page     — Sidnummer (standard 1).
-      per_page — Poster per sida (standard 20, API-max okänt).
+      ar       — Filtrera på publiceringsår (t.ex. 2020).
+      page     — Sidnummer (1-baserat).
+      per_page — Poster per sida (1–30).
 
     Returnerar dict med:
-      page, per_page, total_sidor, total_antal, data (lista med förordningar).
-    Varje förordning innehåller: name (t.ex. '179/2018'), titill, publicerad, ministerium.
+      fraga, ar, page, per_page, total_sidor, total_antal, data.
+    Varje förordning: name (t.ex. '0725/2020'), titill, publicerad, ministerium.
+    Nätverks- och HTTP-fel kastas som httpx-undantag.
     """
-    params: dict = {"page": page, "perPage": per_page}
-    if fraga:
-        params["q"] = fraga
-    if ar is not None:
-        params["year"] = ar
+    if not fraga and ar is None:
+        raise ValueError(
+            "Ange en sökterm eller ett år. Källan returnerar inga träffar "
+            "när båda saknas."
+        )
+    per_page = max(1, min(int(per_page), API_SIDSTORLEK))
+    page     = max(1, int(page))
 
-    try:
-        svar = _get("search", params=params)
-        data = svar.get("data", []) if isinstance(svar, dict) else []
+    forsta = (page - 1) * per_page
+    sista  = forsta + per_page - 1
+    api_forsta = forsta // API_SIDSTORLEK + 1
+    api_sista  = sista // API_SIDSTORLEK + 1
 
-        # Normalisera poster till konsekvent nyckelnamn
-        poster = []
-        for item in data:
-            poster.append({
-                "name":       item.get("name", ""),
-                "titill":     item.get("title", ""),
-                "publicerad": item.get("publishedDate", ""),
-                "ministerium": item.get("ministry", ""),
-            })
+    poster: list[dict] = []
+    total_antal = 0
+    for api_sida in range(api_forsta, api_sista + 1):
+        svar = _sok_sida(fraga, ar, api_sida)
+        # totalItems är 0 för sidor bortom slutet; första svarets värde gäller
+        if api_sida == api_forsta or not total_antal:
+            total_antal = max(total_antal, int(svar.get("totalItems") or 0))
+        data = svar.get("data") or []
+        forskjutning = (api_sida - 1) * API_SIDSTORLEK
+        for i, item in enumerate(data):
+            if forsta <= forskjutning + i <= sista:
+                poster.append({
+                    "name":        item.get("name", ""),
+                    "titill":      item.get("title", ""),
+                    "publicerad":  item.get("publishedDate", ""),
+                    "ministerium": ministerium_namn(item.get("ministry")),
+                })
+        if len(data) < API_SIDSTORLEK:
+            break
 
-        return {
-            "fraga":       fraga,
-            "ar":          ar,
-            "page":        svar.get("page", page),
-            "per_page":    svar.get("perPage", per_page),
-            "total_sidor": svar.get("totalPages", 0),
-            "total_antal": svar.get("totalItems", 0),
-            "data":        poster,
-        }
-    except Exception as exc:
-        log.error("sok_reglugerd misslyckades (fraga=%r ar=%s): %s", fraga, ar, exc)
-        return {"fraga": fraga, "ar": ar, "data": [], "fel": str(exc)}
+    return {
+        "fraga":       fraga,
+        "ar":          ar,
+        "page":        page,
+        "per_page":    per_page,
+        "total_sidor": -(-total_antal // per_page) if total_antal else 0,
+        "total_antal": total_antal,
+        "data":        poster,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Enskild förordning
 # ---------------------------------------------------------------------------
 
+# Fält som redovisas separat och därför inte upprepas i meta_raw.
+_SEPARATA_FALT = {
+    "title", "name", "publishedDate", "ministry", "effectiveDate",
+    "signatureDate", "repealed", "repealedDate", "pdfVersion", "originalDoc",
+    "redirectUrl",
+}
+
+
 def hamta_reglugerd(nr: int, ar: int, version: str = "current") -> dict:
     """
     Hämtar metadata för en enskild förordning via /api/v1/regulation/{nr-ar}/{version}/.
 
-    Parametrar:
-      nr      — Förordningsnummer (t.ex. 179 för nr 179/2018).
-      ar      — Publiceringsår (t.ex. 2018).
-      version — 'current' (gällande, standard) eller 'original' (ursprungstext).
+    Källan ger två svarsformer:
+      - fullständigt svar med bl.a. pdfVersion (länk till konsoliderad PDF),
+      - kortsvar {name, title, redirectUrl, originalDoc} för förordningar som
+        inte är inlagda i strukturerad form. Där finns ingen konsoliderad PDF
+        (…/pdf/ ger 404); originalDoc är i förekommande fall den ursprungliga
+        kungörelsen i Stjórnartíðindi, och redirectUrl sidan på reglugerd.is.
+
+    PDF-länken byggs aldrig själv: pdf_url är pdfVersion, annars originalDoc,
+    annars None, och pdf_typ säger vilken ('konsoliderad', 'originalkungorelse').
 
     Returnerar dict med:
       nr, ar, beteckning, version, titill, publicerad, ministerium,
-      ministerium_okant (True när ministerium saknas i källan),
-      ikrafttradde_vid, signerades_vid, upphavt (bool), upphavt_vid,
-      pdf_url (direktlänk till PDF-fulltext), url (metadata-URL).
-    Returnerar {} om förordningen ej hittas.
+      ministerium_okant, ikrafttradde_vid, signerades_vid, upphavt, upphavt_vid,
+      pdf_url, pdf_typ, webb_url, fullstandig, url, meta_raw
+      (+ notering för kortsvar).
+    Returnerar {} om förordningen inte finns (404). Andra fel kastas.
     """
     nr_ar = _nr_ar_strang(nr, ar)
     url   = f"{API_BASE}/regulation/{nr_ar}/{version}/"
 
-    try:
-        r = httpx.get(url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        meta = r.json()
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 404:
-            log.warning("Förordning %s/%s (version=%s) hittades inte", nr, ar, version)
-        else:
-            log.error("HTTP-fel vid hämtning av förordning %s/%s: %s", nr, ar, exc)
+    r = httpx.get(url, headers=HEADERS, timeout=30)
+    if r.status_code == 404:
+        log.warning("Förordning %s/%s (version=%s) hittades inte", nr, ar, version)
         return {}
-    except Exception as exc:
-        log.error("hamta_reglugerd misslyckades (%s/%s): %s", nr, ar, exc)
-        return {}
+    r.raise_for_status()
+    meta = r.json()
 
-    pdf_url = f"{API_BASE}/regulation/{nr_ar}/{version}/pdf/"
+    fullstandig = "pdfVersion" in meta or "publishedDate" in meta
+    if meta.get("pdfVersion"):
+        pdf_url, pdf_typ = meta["pdfVersion"], "konsoliderad"
+    elif meta.get("originalDoc"):
+        pdf_url, pdf_typ = meta["originalDoc"], "originalkungorelse"
+    else:
+        pdf_url, pdf_typ = None, None
 
-    ministerium_val = meta.get("ministry", "")
-    return {
-        "nr":               nr,
-        "ar":               ar,
-        "beteckning":       f"{nr}/{ar}",
-        "version":          version,
-        "titill":           meta.get("title", meta.get("name", "")),
-        "publicerad":       meta.get("publishedDate", ""),
-        "ministerium":      ministerium_val,
-        "ministerium_okant": not bool(ministerium_val),
-        "ikrafttradde_vid": meta.get("effectiveDate"),
-        "signerades_vid":   meta.get("signatureDate"),
-        "upphavt":          bool(meta.get("repealed", False)),
-        "upphavt_vid":      meta.get("repealedDate"),
-        "pdf_url":          pdf_url,
-        "url":              url,
-        "meta_raw":         {k: v for k, v in meta.items()
-                              if k not in ("title", "name", "publishedDate", "ministry",
-                                           "effectiveDate", "signatureDate",
-                                           "repealed", "repealedDate")},
+    ministerium = ministerium_namn(meta.get("ministry"))
+    svar = {
+        "nr":                nr,
+        "ar":                ar,
+        "beteckning":        f"{nr}/{ar}",
+        "version":           version,
+        "titill":            meta.get("title") or meta.get("name", ""),
+        "publicerad":        meta.get("publishedDate"),
+        "ministerium":       ministerium,
+        "ministerium_okant": not ministerium,
+        "ikrafttradde_vid":  meta.get("effectiveDate"),
+        "signerades_vid":    meta.get("signatureDate"),
+        "upphavt":           bool(meta.get("repealed", False)),
+        "upphavt_vid":       meta.get("repealedDate"),
+        "pdf_url":           pdf_url,
+        "pdf_typ":           pdf_typ,
+        "webb_url":          meta.get("redirectUrl")
+                             or f"https://www.reglugerd.is/reglugerdir/allar/nr/{nr_ar}",
+        "fullstandig":       fullstandig,
+        "url":               url,
+        "meta_raw":          {k: v for k, v in meta.items() if k not in _SEPARATA_FALT},
     }
-
-
-def hamta_reglugerd_pdf_url(nr: int, ar: int, version: str = "current") -> str:
-    """
-    Bygger direktlänken till en förordnings PDF utan att göra ett API-anrop.
-    Används när pdf_url redan är känd och ingen metadata-hämtning behövs.
-
-    Returnerar: 'https://api.reglugerd.is/api/v1/regulation/{nr-ar}/{version}/pdf/'
-    """
-    nr_ar = _nr_ar_strang(nr, ar)
-    return f"{API_BASE}/regulation/{nr_ar}/{version}/pdf/"
+    if not fullstandig:
+        svar["notering"] = (
+            "Källan har bara titel och länkar för denna förordning (ingen "
+            "strukturerad text och ingen konsoliderad PDF). "
+            + ("pdf_url är den ursprungliga kungörelsen i Stjórnartíðindi. "
+               if pdf_url else "Ingen PDF finns via API:t. ")
+            + "Läs gällande lydelse på webb_url."
+        )
+    return svar

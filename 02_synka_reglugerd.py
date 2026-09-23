@@ -22,7 +22,7 @@ API-struktur:
     { "name": "1424/2020", "title": "Reglugerð um ...",
       "publishedDate": "2020-12-30", "ministry": "..." }
 
-  PDF-URL: https://api.reglugerd.is/api/v1/regulation/{nr:04d}-{ar}/current/pdf/
+  PDF-länk lagras inte här: bara detaljsvaret visar om en PDF finns.
 
 Totalt ~3 000–5 000 förordningar (skattat från stickprov per år).
 Inga robots.txt-restriktioner — API utan crawl-delay.
@@ -78,19 +78,6 @@ def _hamta_sida(client: httpx.Client, ar: str, sida: int) -> dict:
     )
     r.raise_for_status()
     return r.json()
-
-
-def _bygg_pdf_url(nr_str: str, ar_str: str) -> str:
-    """
-    Bygger PDF-URL från name-fält (t.ex. '179/2018' eller '1424/2020').
-    Format: /api/v1/regulation/{nr:04d}-{ar}/current/pdf/
-    """
-    try:
-        nr_del, ar_del = nr_str.split("/")
-        nr_int = int(nr_del)
-        return f"{API_BASE}/regulation/{nr_int:04d}-{ar_del}/current/pdf/"
-    except Exception:
-        return ""
 
 
 def _normalisera_beteckning(name: str) -> str:
@@ -187,7 +174,6 @@ def synka_reglugerd() -> dict:
                         continue
 
                     beteckning = _normalisera_beteckning(name)
-                    pdf_url    = _bygg_pdf_url(name, ar)
                     url        = f"{API_BASE}/regulation/{name.replace('/', '-').zfill(9)}/current/"
 
                     # Bygg url på enklare sätt: {nr:04d}-{ar}
@@ -208,7 +194,11 @@ def synka_reglugerd() -> dict:
                             skjalnr    = None,
                             dagsetning = publicerad,
                             url        = url,
-                            pdf_url    = pdf_url,
+                            # Sökresultatet säger inte om en konsoliderad
+                            # PDF finns (många förordningar saknar den och
+                            # …/pdf/ ger 404). Länken tas i stället ur
+                            # detaljsvaret av is_hamta_reglugerd.
+                            pdf_url    = None,
                             fulltext_md = None,  # on-demand via MCP
                         )
                         stats["upsertade"] += 1

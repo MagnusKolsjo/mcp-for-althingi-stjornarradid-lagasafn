@@ -944,4 +944,13 @@ def is_sok_i_dokument(
 # ── Serverstart ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+
+    # Servern tar inga argument; transporten styrs av MCP_TRANSPORT m.fl.
+    # Tolkningen gör att --help visar det i stället för att starta servern.
+    argparse.ArgumentParser(
+        description="MCP-server för isländsk riksdags- och rättsdata. Transport och "
+                    "databas styrs av miljövariablerna MCP_TRANSPORT, MCP_HOST, "
+                    "MCP_PORT, MCP_API_KEY och DATABASE_URL (se config.example.env).",
+    ).parse_args()
     starta(mcp, standardport=STANDARDPORT, initiera=initiera_schema)

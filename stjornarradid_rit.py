@@ -932,34 +932,45 @@ def synka_rit(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
     import sys
+
+    # Argumenten tolkas innan något körs, så att --help och okända flaggor
+    # aldrig startar listning eller synk.
+    parser = argparse.ArgumentParser(
+        description="Synk av rit og skýrslur från stjornarradid.is till lokal databas. "
+                    "Utan flaggor körs hela synken.",
+    )
+    lage = parser.add_mutually_exclusive_group()
+    lage.add_argument("--lista-bara", action="store_true",
+                      help="lista publikationer utan att skriva till databasen")
+    lage.add_argument("--uppdatera-urler", action="store_true",
+                      help="bara flytta poster med äldre /stakt-rit/-URL till /rit/-formen")
+    parser.add_argument("--torrkorning", action="store_true",
+                        help="med --uppdatera-urler: visa vad som skulle ändras, utan att skriva")
+    parser.add_argument("--max-pdf", type=int, metavar="N",
+                        help="begränsa PDF-extraktionen till N publikationer, t.ex. vid test")
+    args = parser.parse_args()
+    if args.torrkorning and not args.uppdatera_urler:
+        parser.error("--torrkorning kräver --uppdatera-urler")
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+    max_pdf: Optional[int] = args.max_pdf
 
-    # --max-pdf N          begränsa PDF-extraktionen, t.ex. vid test
-    # --lista-bara         lista utan att skriva till databasen
-    # --uppdatera-urler    bara flytta poster med äldre /stakt-rit/-URL
-    #   --torrkorning      visa vad som skulle ändras, utan att skriva
-    max_pdf: Optional[int] = None
-    if "--max-pdf" in sys.argv:
-        idx = sys.argv.index("--max-pdf")
-        if idx + 1 < len(sys.argv):
-            max_pdf = int(sys.argv[idx + 1])
-
-    if "--lista-bara" in sys.argv:
+    if args.lista_bara:
         poster = hamta_rit_lista()
         for p in poster[:10]:
             print(f"  {p['dagsetning']}  {p['titill'][:70]}")
         print(f"... totalt {len(poster)} poster")
         sys.exit(0 if poster else 1)
 
-    if "--uppdatera-urler" in sys.argv:
+    if args.uppdatera_urler:
         import db as _db
-        torr = "--torrkorning" in sys.argv
+        torr = args.torrkorning
         _db.initiera_schema()
         s = uppdatera_aldre_urler(_db, torrkorning=torr)
         rubrik = "Äldre URL:er (torrkörning — inget ändrat)" if torr else "Äldre URL:er"

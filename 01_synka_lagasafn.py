@@ -285,7 +285,23 @@ def _installera_launchd_schema() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
     import sys
+
+    # Argumenten tolkas innan något körs, så att --help och okända flaggor
+    # aldrig startar en synk.
+    parser = argparse.ArgumentParser(
+        description="Bulk-synk av konsoliderade lagar från althingi.is/lagasafn/.",
+    )
+    parser.add_argument(
+        "--installera-schema", action="store_true",
+        help="skriv och visa launchd-schemat för den dagliga synken, och avsluta",
+    )
+    parser.add_argument(
+        "--version", default="nuna", metavar="VERSION",
+        help="lagasafn-version: 'nuna' (gällande, standard) eller riksmötessuffix som '157a'",
+    )
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -293,17 +309,11 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
 
-    if "--installera-schema" in sys.argv:
+    if args.installera_schema:
         _installera_launchd_schema()
         sys.exit(0)
 
-    version = "nuna"
-    if "--version" in sys.argv:
-        idx = sys.argv.index("--version")
-        if idx + 1 < len(sys.argv):
-            version = sys.argv[idx + 1]
-
-    resultat = synka_lagasafn(version=version)
+    resultat = synka_lagasafn(version=args.version)
     print(
         f"\nSynk klar:\n"
         f"  Version:    {resultat['version']}\n"

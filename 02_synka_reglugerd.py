@@ -246,6 +246,14 @@ def synka_reglugerd() -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    # Tolkas innan något körs, så att --help och okända flaggor aldrig
+    # startar en synk.
+    argparse.ArgumentParser(
+        description="Bulk-synk av metadata för isländska förordningar från api.reglugerd.is.",
+    ).parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",

@@ -75,6 +75,10 @@ tillämpar [Semantic Versioning](https://semver.org/).
   30 (`perPage` ignoreras av källan).
 - `is_sok_i_dokument` svarade med tomma träfflistor när Postgres var nere.
   Databasfel ger nu ett MCP-fel med orsaken.
+- `--help` och okända flaggor till `stjornarradid_rit.py`,
+  `01_synka_lagasafn.py`, `02_synka_reglugerd.py` och `mcp_server.py` startade
+  synken respektive servern. Argumenten tolkas nu med argparse innan något
+  körs; `--help` visar hjälpen och en okänd flagga ger fel (exitkod 2).
 - Absoluta SQLite-sökvägar (`sqlite:////abs/fil.db`) tolkades som relativa.
 - En tom rit-listning ger exitkod 1 i stället för att synken tyst lyckas.
 

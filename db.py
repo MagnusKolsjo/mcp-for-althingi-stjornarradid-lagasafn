@@ -554,6 +554,15 @@ def lista_rit_urler_med_monster(monster: str) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def lista_rit_urler_med_slug(slug: str) -> list[str]:
+    """Returnerar url för poster med /rit/-URL och given slug."""
+    sql = (f"SELECT url FROM {_prefix()}dokument_rit "
+           f"WHERE slug = {_ph()} AND url NOT LIKE {_ph()} ORDER BY url")
+    with _cursor() as cur:
+        cur.execute(sql, (slug, "%/stakt-rit/%"))
+        return [r[0] for r in cur.fetchall()]
+
+
 def flytta_dokument_rit(gammal_url: str, ny_url: str, ny_slug: str) -> str:
     """
     Flyttar en post i dokument_rit från gammal_url till ny_url, i en transaktion.

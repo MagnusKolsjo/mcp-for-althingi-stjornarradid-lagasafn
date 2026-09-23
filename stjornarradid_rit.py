@@ -586,7 +586,9 @@ def uppdatera_aldre_urler(db_mod=None) -> dict:
     Flyttar poster i dokument_rit som har den äldre /stakt-rit/-formen till
     den kanoniska /rit/-URL:en.
 
-    Omdirigeringen följs per post och målsidan kontrolleras. Finns redan en
+    Omdirigeringen följs per post och målsidan kontrolleras. Leder den till
+    en mallsida används i stället en befintlig /rit/-post med samma slug, om
+    det finns exakt en. Finns redan en
     post med den nya URL:en (från en synk mot den nya listningen) slås de ihop:
     den nya postens fält behålls och luckor fylls från den gamla, liksom
     chunks om den nya saknar sådana. Den gamla posten tas sedan bort.
@@ -611,8 +613,18 @@ def uppdatera_aldre_urler(db_mod=None) -> dict:
     for gammal in aldre:
         ny = folj_omdirigering(gammal)
         if not ny:
-            stats["hittades_inte"].append(gammal)
-            continue
+            # Webbplatsen har bytt datum på en del publikationer, så att
+            # omdirigeringen (som behåller det gamla datumet) leder till en
+            # mallsida. Finns exakt en /rit/-post med samma slug är det samma
+            # publikation.
+            m = _STAKT_RIT_RE.search(gammal)
+            kandidater = db_mod.lista_rit_urler_med_slug(m.group(4)) if m else []
+            if len(kandidater) == 1:
+                ny = kandidater[0]
+                log.info("Omdirigeringen ledde ingenstans; slug matchar %s", ny)
+            else:
+                stats["hittades_inte"].append(gammal)
+                continue
         slug, _ = _slug_och_datum(ny)
         try:
             utfall = db_mod.flytta_dokument_rit(gammal, ny, slug)
@@ -686,10 +698,11 @@ def synka_rit(
     Synkroniserar rit og skýrslur från stjornarradid.is till lokal DB.
 
     Flöde:
-      1. Flytta eventuella poster med äldre /stakt-rit/-URL (no-op när inga finns).
-      2. Hämta hela listningen (alla ?index=-sidor).
-      3. Upsert metadata för alla poster. Befintlig fulltext och PDF-länk
+      1. Hämta hela listningen (alla ?index=-sidor).
+      2. Upsert metadata för alla poster. Befintlig fulltext och PDF-länk
          behålls.
+      3. Flytta eventuella poster med äldre /stakt-rit/-URL och slå ihop dem
+         med listningens poster (no-op när inga finns).
       4. För poster utan fulltext: hämta publikationssidan, ladda ner PDF,
          extrahera markdown, radera PDF, uppdatera DB.
       5. Uppdatera island.sync_status.
@@ -715,23 +728,14 @@ def synka_rit(
         "aldre_urler":     None,
     }
 
-    # ── Steg 1: Äldre URL:er ─────────────────────────────────────────────────
-    try:
-        aldre = uppdatera_aldre_urler(db_mod)
-        stats["aldre_urler"] = {k: (len(v) if isinstance(v, list) else v)
-                                for k, v in aldre.items()}
-    except Exception as exc:
-        log.error("Uppdatering av äldre URL:er misslyckades: %s", exc)
-        stats["fel"].append({"url": None, "fel": f"äldre URL:er: {exc}"})
-
-    # ── Steg 2: Hämta lista ──────────────────────────────────────────────────
+    # ── Steg 1: Hämta lista ──────────────────────────────────────────────────
     poster = hamta_rit_lista()
     stats["hämtade"] = len(poster)
     if not poster:
         log.warning("synka_rit: Inga publikationer hämtades — avbryter.")
         return stats
 
-    # ── Steg 3: Upsert metadata ──────────────────────────────────────────────
+    # ── Steg 2: Upsert metadata ──────────────────────────────────────────────
     for p in poster:
         try:
             db_mod.upsert_dokument_rit(
@@ -752,6 +756,15 @@ def synka_rit(
             stats["fel"].append({"url": p["url"], "fel": str(exc)})
 
     log.info("Metadata upsertad för %d publikationer.", stats["nya_metadata"])
+
+    # ── Steg 3: Äldre URL:er ─────────────────────────────────────────────────
+    try:
+        aldre = uppdatera_aldre_urler(db_mod)
+        stats["aldre_urler"] = {k: (len(v) if isinstance(v, list) else v)
+                                for k, v in aldre.items()}
+    except Exception as exc:
+        log.error("Uppdatering av äldre URL:er misslyckades: %s", exc)
+        stats["fel"].append({"url": None, "fel": f"äldre URL:er: {exc}"})
 
     # ── Steg 4: PDF-extraktion ───────────────────────────────────────────────
     pdf_count = 0

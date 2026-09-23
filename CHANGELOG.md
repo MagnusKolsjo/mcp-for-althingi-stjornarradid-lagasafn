@@ -60,6 +60,15 @@ tillämpar [Semantic Versioning](https://semver.org/).
 - Absoluta SQLite-sökvägar (`sqlite:////abs/fil.db`) tolkades som relativa.
 - En tom rit-listning ger exitkod 1 i stället för att synken tyst lyckas.
 
+### Säkerhet
+
+- `is_hamta_skyrsla` och Stjórnarráðið-klienten kontaktar bara
+  `https://www.stjornarradid.is` (och `stjornarradid.is`). Schema, värd, port
+  och sökväg kontrolleras innan något hämtas, och varje omdirigeringsmål
+  kontrolleras på samma sätt i stället för att följas blint. Tidigare kunde
+  en anropare få servern att hämta godtyckliga adresser, även i det lokala
+  nätet. Adresser med `http://` avvisas.
+
 ### Borttaget
 
 - Den egna Starlette-appen för http-läget (`create_starlette_app` finns inte

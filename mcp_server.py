@@ -628,7 +628,15 @@ def _las_rit_fran_db(url: str) -> tuple[Optional[dict], str]:
     post = _las(url)
     if post:
         return post, url
-    nyckel = sr.folj_omdirigering(url) if sr.ar_aldre_url(url) else sr.kanonisk_rit_url(url)
+    if sr.ar_aldre_url(url):
+        try:
+            nyckel = sr.folj_omdirigering(url)
+        except sr.Natverksfel as exc:
+            raise ToolError(f"stjornarradid.is svarade inte ({exc}). Försök igen.")
+    else:
+        # Kontrollerar också värden: en URL utanför stjornarradid.is ger None
+        # och hämtas aldrig.
+        nyckel = sr.kanonisk_rit_url(url)
     if not nyckel:
         return None, url
     if nyckel != url:
@@ -746,6 +754,10 @@ def is_hamta_skyrsla(
         # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
         return _trunkera_rit(cached, max_tecken, fran_tecken)
 
+    if sr.ar_aldre_url(nyckel):
+        raise ToolError(
+            f"Publikationen bakom '{url}' finns inte längre på stjornarradid.is."
+        )
     if not sr.kanonisk_rit_url(nyckel):
         raise ToolError(
             f"'{url}' är ingen publikations-URL på stjornarradid.is. Hämta url "
@@ -754,6 +766,8 @@ def is_hamta_skyrsla(
 
     try:
         result = sr.hamta_rit_fulltext(nyckel)
+    except sr.OtillatenUrl as exc:
+        raise ToolError(str(exc))
     except Exception as exc:
         log.error("is_hamta_skyrsla misslyckades (%s): %s", url, exc)
         raise ToolError(f"Hämtningen från stjornarradid.is misslyckades ({exc}).")

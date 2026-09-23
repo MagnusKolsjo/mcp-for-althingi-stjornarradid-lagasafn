@@ -85,7 +85,7 @@ HEADERS     = {
 }
 
 # Övre gräns för antalet listningssidor, så att en ändrad paginering aldrig
-# kan ge en oändlig loop (listningen har i dag 16 sidor).
+# kan ge en oändlig loop.
 MAX_LISTSIDOR = 200
 
 # Isländska månadsnamn i listningens datum, t.ex. "01 júlí 2026".
@@ -179,20 +179,46 @@ def extrahera_dokumenttyp(titill: str) -> Optional[str]:
 # URL-former
 # ---------------------------------------------------------------------------
 
-# Äldre webbplatsens form: /stakt-rit/YYYY/MM/DD/SLUG/
-_STAKT_RIT_RE = re.compile(r'/stakt-rit/(\d{4})/(\d{2})/(\d{2})/([^/?#]+)/?')
+# Äldre webbplatsens form: /gogn/rit-og-skyrslur/stakt-rit/YYYY/MM/DD/SLUG/
+_STAKT_RIT_RE = re.compile(
+    r'^/gogn/rit-og-skyrslur/stakt-rit/(\d{4})/(\d{2})/(\d{2})/([^/?#]+)/?$'
+)
 
 # Omdirigeringsmålets form: /rit/YYYY/MM/DD/SLUG/
-_RIT_DATUMSTIG_RE = re.compile(r'/gogn/rit-og-skyrslur/rit/(\d{4})/(\d{2})/(\d{2})/([^/?#]+)/?$')
+_RIT_DATUMSTIG_RE = re.compile(r'^/gogn/rit-og-skyrslur/rit/(\d{4})/(\d{2})/(\d{2})/([^/?#]+)/?$')
 
 # Listningens form: /rit/SEGMENT, där SEGMENT kan börja med YYYY-MM-DD-
-_RIT_SEGMENT_RE = re.compile(r'/gogn/rit-og-skyrslur/rit/([^/?#]+)/?$')
+_RIT_SEGMENT_RE = re.compile(r'^/gogn/rit-og-skyrslur/rit/([^/?#]+)/?$')
 _DATUMPREFIX_RE = re.compile(r'^(\d{4})-(\d{2})-(\d{2})-(.+)$')
+
+# Den enda värd modulen får kontakta. URL:er kommer delvis från anroparen
+# (is_hamta_skyrsla) och delvis från webbplatsens egna länkar och
+# omdirigeringar; utan den här kontrollen kunde servern fås att hämta
+# godtyckliga adresser, även i det lokala nätet.
+_TILLATNA_VARDAR = frozenset({"www.stjornarradid.is", "stjornarradid.is"})
+
+
+class OtillatenUrl(ValueError):
+    """URL:en pekar utanför stjornarradid.is eller har fel schema."""
+
+
+def ar_tillaten_url(url: str) -> bool:
+    """True om url är https mot stjornarradid.is, utan användaruppgifter och port."""
+    try:
+        d = urlparse(url or "")
+        return (
+            d.scheme == "https"
+            and (d.hostname or "").lower() in _TILLATNA_VARDAR
+            and d.username is None and d.password is None
+            and d.port in (None, 443)
+        )
+    except ValueError:
+        return False
 
 
 def ar_aldre_url(url: str) -> bool:
-    """True om url har den äldre webbplatsens form (/stakt-rit/…)."""
-    return bool(_STAKT_RIT_RE.search(url or ""))
+    """True om url är en tillåten URL i den äldre webbplatsens form (/stakt-rit/…)."""
+    return ar_tillaten_url(url) and bool(_STAKT_RIT_RE.match(urlparse(url).path))
 
 
 def kanonisk_rit_url(url: str) -> Optional[str]:
@@ -205,11 +231,16 @@ def kanonisk_rit_url(url: str) -> Optional[str]:
       /gogn/rit-og-skyrslur/rit/slug-utan-datum → …/rit/slug-utan-datum/
 
     Den äldre /stakt-rit/-formen ger None: den måste följas via webbplatsens
-    omdirigering (se folj_omdirigering).
+    omdirigering (se folj_omdirigering). En absolut URL mot någon annan värd
+    än stjornarradid.is ger också None; relativa sökvägar (listningens länkar)
+    tolkas mot webbplatsen.
     """
     if not url:
         return None
-    sokvag = urlparse(urljoin(BASE_URL, url.strip())).path
+    absolut = urljoin(BASE_URL + "/", url.strip())
+    if not ar_tillaten_url(absolut):
+        return None
+    sokvag = urlparse(absolut).path
     m = _RIT_DATUMSTIG_RE.search(sokvag)
     if m:
         ar_s, mm_s, dd_s, slug = m.groups()
@@ -234,22 +265,54 @@ def _slug_och_datum(kanonisk_url: str) -> tuple[str, Optional[str]]:
 # HTTP-hjälpare
 # ---------------------------------------------------------------------------
 
-def _hamta(url: str, intervall: float = CRAWL_DELAY) -> Optional[httpx.Response]:
+# Fler omdirigeringar än så förekommer inte på webbplatsen (äldre URL → /rit/
+# → avslutande snedstreck); en längre kedja behandlas som fel.
+MAX_OMDIRIGERINGAR = 5
+
+
+class Natverksfel(RuntimeError):
+    """Webbplatsen svarade inte, eller svarade med 5xx."""
+
+
+def _hamta(url: str, intervall: float = CRAWL_DELAY,
+           kasta_vid_natverksfel: bool = False) -> Optional[httpx.Response]:
     """
-    GET med projektets User-Agent och takt. Följer omdirigeringar.
-    Returnerar svaret vid 2xx, annars None (felet loggas).
+    GET med projektets User-Agent och takt.
+
+    Omdirigeringar följs för hand: varje mål kontrolleras mot värdlistan innan
+    det hämtas. Startadressen kontrolleras likadant, så att ingenting utanför
+    stjornarradid.is någonsin kontaktas (OtillatenUrl kastas).
+
+    Returnerar svaret vid 2xx, annars None (felet loggas). Med
+    kasta_vid_natverksfel kastas Natverksfel vid nätverksfel och 5xx, så att
+    anroparen kan skilja "finns inte" från "gick inte att fråga".
     """
-    _throttle(intervall)
-    try:
-        r = _klient.get(url, follow_redirects=True)
-        r.raise_for_status()
-        return r
-    except httpx.HTTPStatusError as exc:
-        log.warning("HTTP %s vid %s", exc.response.status_code, url)
+    aktuell = url
+    for _ in range(MAX_OMDIRIGERINGAR + 1):
+        if not ar_tillaten_url(aktuell):
+            raise OtillatenUrl(f"Adressen är inte https mot stjornarradid.is: {aktuell}")
+        _throttle(intervall)
+        try:
+            r = _klient.get(aktuell, follow_redirects=False)
+        except httpx.HTTPError as exc:
+            log.error("Nätverksfel vid %s: %s", aktuell, exc)
+            if kasta_vid_natverksfel:
+                raise Natverksfel(f"{aktuell}: {exc}") from exc
+            return None
+        if r.is_redirect:
+            mal = r.headers.get("location", "")
+            aktuell = urljoin(aktuell, mal)
+            continue
+        if r.is_success:
+            return r
+        log.warning("HTTP %s vid %s", r.status_code, aktuell)
+        if kasta_vid_natverksfel and r.status_code >= 500:
+            raise Natverksfel(f"{aktuell}: HTTP {r.status_code}")
         return None
-    except httpx.HTTPError as exc:
-        log.error("Nätverksfel vid %s: %s", url, exc)
-        return None
+    log.warning("För många omdirigeringar från %s", url)
+    if kasta_vid_natverksfel:
+        raise Natverksfel(f"{url}: för många omdirigeringar")
+    return None
 
 
 def _ar_publikationssida(tree) -> bool:
@@ -268,8 +331,14 @@ def folj_omdirigering(aldre_url: str) -> Optional[str]:
 
     Omdirigeringen skriver om sökvägen mönstermässigt, även för sidor som inte
     finns. Därför hämtas målsidan och kontrolleras innan URL:en godtas.
+
+    Kastar OtillatenUrl om aldre_url inte är en /stakt-rit/-URL på
+    stjornarradid.is (inget anrop görs då), och Natverksfel om webbplatsen
+    inte gick att fråga.
     """
-    r = _hamta(aldre_url, intervall=2.0)
+    if not ar_aldre_url(aldre_url):
+        raise OtillatenUrl(f"Ingen äldre publikations-URL på stjornarradid.is: {aldre_url}")
+    r = _hamta(aldre_url, intervall=2.0, kasta_vid_natverksfel=True)
     if r is None:
         return None
     try:
@@ -420,6 +489,8 @@ def _pdf_kandidater(tree) -> list[str]:
         if "/library" not in lagre or not ("itemid=" in lagre or lagre.endswith(".pdf")):
             continue
         absolut = urljoin(BASE_URL + "/", href)
+        if not ar_tillaten_url(absolut):
+            continue
         tydlig = (
             a.get("rel", "") == "download"
             or "type=pdf" in lagre

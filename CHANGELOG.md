@@ -7,6 +7,67 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Ändrat
+
+- **Brytande:** kräver `mcp` 2.x (`mcp>=2.0,<3`). Servern bygger på
+  `MCPServer`; transporten startas via `mcp_transport.py`.
+- **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel avbryts
+  uppstarten med exitkod 2 i stället för att servern startar oskyddad.
+  Saknad `Authorization`-header ger 401, fel nyckel 403. http-läget
+  (Streamable HTTP på `/mcp`, port 8006) startade inte alls tidigare.
+- **Brytande:** förväntade fel (okänd beteckning, okänt þing, dokument som
+  inte finns, källan svarar inte, databasen nere) ges som MCP-fel med
+  `isError` och ett svenskt meddelande, i stället för ett svar med
+  `fel`-nyckel.
+- **Brytande:** `is_hamta_reglugerd` — `ministerium` är alltid namnet som
+  sträng (tidigare ibland objektet `{slug, name}`). `pdf_url` kan vara `null`.
+- **Brytande:** `is_sok_reglugerd` — sökning utan både sökterm och år avvisas
+  (källan gav då alltid 0 träffar). `max_treff` gäller nu, 1–30.
+- Alla verktyg har titel, annotationer (läsande; öppen eller sluten värld)
+  och utdataschema.
+- Stjórnarráðið hämtas med vanlig HTTP-klient och projektets User-Agent;
+  webbläsarimitationen via `curl_cffi` behövs inte där. (Alþingi och
+  lagasafn använder den fortfarande.)
+- Lås kring lat inläsning av embeddingmodellen, þing-listans cache och
+  takthinkarna mot althingi.is och stjornarradid.is, eftersom verktygen körs
+  på arbetstrådar.
+
+### Tillagt
+
+- `stjornarradid_rit.py --uppdatera-urler`: flyttar lagrade publikationer från
+  webbplatsens äldre `/stakt-rit/`-adresser till de nuvarande `/rit/`-adresserna
+  via omdirigeringen och slår ihop dem med poster som redan lagts in under den
+  nya adressen. Idempotent; körs också automatiskt i synken.
+- `is_hamta_reglugerd`: fälten `pdf_typ`, `webb_url`, `fullstandig` och, för
+  förordningar där källan bara har titel och länkar, `notering`.
+
+### Rättat
+
+- Stjórnarráðið-skrapningen fungerar mot den ombyggda webbplatsen: ny
+  listning med paginering (`?index=N`, omkring 780 publikationer 1991–idag),
+  nya publikationsadresser och PDF-länkar under `/library/?itemid=`.
+  Webbplatsens mallsida för okända adresser känns igen.
+- `is_hamta_skyrsla` tar emot både äldre och nya publikationsadresser.
+- Metadatasynken för rit og skýrslur skrev över redan extraherad fulltext med
+  tomt värde. Befintlig fulltext och PDF-länk behålls nu.
+- `is_hamta_reglugerd` använder källans `pdfVersion` och bygger aldrig en
+  PDF-länk som ger 404. `02_synka_reglugerd.py` lagrar inga konstruerade
+  PDF-länkar.
+- `is_sok_reglugerd` räknar om sidindelningen efter källans fasta sidstorlek
+  30 (`perPage` ignoreras av källan).
+- Absoluta SQLite-sökvägar (`sqlite:////abs/fil.db`) tolkades som relativa.
+- En tom rit-listning ger exitkod 1 i stället för att synken tyst lyckas.
+
+### Borttaget
+
+- Den egna Starlette-appen för http-läget (`create_starlette_app` finns inte
+  i mcp).
+- `reglugerd.hamta_reglugerd_pdf_url()`, som byggde PDF-länkar utan kontroll.
+
+---
+
 ## [1.1.0] — 2026-08-10
 
 ### Tillagt

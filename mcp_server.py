@@ -29,20 +29,27 @@ Datakällor:
   Lagasafn          — althingi.is/lagasafn/ (konsoliderade lagar)
   Reglugerd.is      — api.reglugerd.is (förordningar)
   Stjórnartíðindi   — api.stjornartidindi.is (officiell tidning)
-  Stjórnarráðið     — stjornarradid.is RSS + LisasticSearch
+  Stjórnarráðið     — stjornarradid.is, listningen under /gogn/rit-og-skyrslur/
 
-Transport-lägen (styrs via MCP_TRANSPORT i .env):
-  stdio (standard):   python3 mcp_server.py
-  http (hostad):      MCP_TRANSPORT=http python3 mcp_server.py
+Transport (styrs via MCP_TRANSPORT i .env, se mcp_transport.py):
+  stdio:  python3 mcp_server.py
+  http:   MCP_TRANSPORT=http MCP_API_KEY=<nyckel> python3 mcp_server.py
 """
 
 import logging
 import os
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, TypedDict
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+
+# .env läses innan klientmodulerna importeras, eftersom de läser sin
+# konfiguration vid import och servern inte ärver klientens shell-miljö.
+load_dotenv(Path(__file__).parent / ".env")
+
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 import althingi as al
 import lagasafn as ls
@@ -51,17 +58,15 @@ import stjornarradid_rit as sr
 import db as db_mod
 from db import initiera_schema
 from klient_fel import HamtaFel
-
-load_dotenv(Path(__file__).parent / ".env")
+from mcp_annotationer import CACHE_HINTAR, LASNING_DB, LASNING_EXTERN
+from mcp_transport import starta
 
 # ── Konfiguration ──────────────────────────────────────────────────────────────
 
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 
-MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "stdio").lower()
-MCP_HOST      = os.getenv("MCP_HOST",      "127.0.0.1")
-MCP_PORT      = int(os.getenv("MCP_PORT",  "8006"))
-MCP_API_KEY   = os.getenv("MCP_API_KEY",   "")
+# Standardport i http-läget; MCP_PORT i .env har företräde.
+STANDARDPORT = 8006
 
 # ── Query-expansion ────────────────────────────────────────────────────────────
 QUERY_EXPANSION_ENABLED     = os.getenv("QUERY_EXPANSION_ENABLED", "false").lower() == "true"
@@ -77,6 +82,7 @@ QUERY_EXPANSION_PROMPT_FILE = os.getenv(
 # intfloat/multilingual-e5-base: bästa tillgängliga för isländska (768 dim)
 EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
 _embedding_modell = None
+_embedding_las    = threading.Lock()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,8 +130,10 @@ def _skar_ut(text, max_tecken: int, fran_tecken: int = 0) -> dict:
 
 # ── MCP-server ─────────────────────────────────────────────────────────────────
 
-mcp = FastMCP(
+mcp = MCPServer(
     "island",
+    version="1.1.0",
+    cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för isländsk riksdags- och rättsdata. "
         "Täcker Alþingi (þingskjöl, þingmál, voteringar 1845–idag), "
@@ -138,15 +146,67 @@ mcp = FastMCP(
     ),
 )
 
-# Cache för þing-lista (hämtas en gång, återanvänds)
+# Cache för þing-lista (hämtas en gång, återanvänds). Verktygen körs på
+# arbetstrådar; låset hindrar att flera samtidiga första anrop hämtar listan
+# parallellt.
 _thing_lista_cache: Optional[list] = None
+_thing_lista_las = threading.Lock()
 
 
 def _thing_lista() -> list[dict]:
     global _thing_lista_cache
     if _thing_lista_cache is None:
-        _thing_lista_cache = al.hamta_thing_lista()
+        with _thing_lista_las:
+            if _thing_lista_cache is None:
+                _thing_lista_cache = al.hamta_thing_lista()
     return _thing_lista_cache
+
+
+# ── Returtyper ─────────────────────────────────────────────────────────────────
+# Stabila skal typas fullt ut; träfflistor och källdata med varierande fält
+# (null-fält i historiska poster) typas som dict[str, Any].
+
+class ThingLista(TypedDict):
+    thing_antal: int
+    thing_lista: list[dict[str, Any]]
+
+
+class AlthingiSok(TypedDict):
+    fraga: str
+    expansion: list[str]
+    lthing: int
+    malstegund: str
+    treff_antal: int
+    treff: list[dict[str, Any]]
+
+
+class ReglugerdSok(TypedDict):
+    fraga: str
+    ar: Optional[int]
+    page: int
+    per_page: int
+    total_sidor: int
+    total_antal: int
+    data: list[dict[str, Any]]
+
+
+class SkyrslurSok(TypedDict):
+    fraga: str
+    expansion: list[str]
+    ministerium: Optional[str]
+    ar: Optional[int]
+    dokumenttyp: Optional[str]
+    treff_antal: int
+    treff: list[dict[str, Any]]
+
+
+class SemantiskSok(TypedDict):
+    fraga: str
+    expansion: list[str]
+    tabell: str
+    kalla: str
+    dokument: list[dict[str, Any]]
+    rit: list[dict[str, Any]]
 
 
 def expandera_fraga(fraga: str) -> list[str]:
@@ -186,33 +246,31 @@ def expandera_fraga(fraga: str) -> list[str]:
         return []
 
 
-# ── Felhantering — översätt HamtaFel till MCP-svarsformat ─────────────────────
+# ── Felhantering — översätt HamtaFel till ToolError ───────────────────────────
 
-def _fel_fran_hamtafel(exc: HamtaFel, bas: dict, ej_hittad_text: str) -> dict:
+def _toolerror_fran_hamtafel(exc: HamtaFel, ej_hittad_text: str) -> ToolError:
     """
-    Översätter en HamtaFel till ett MCP-svar (dict med 'fel'-nyckel + extra fält).
+    Översätter en HamtaFel till ett ToolError med begripligt meddelande.
     Differentierar 403 (bot-shield), 404 (resursen finns inte) och övriga fel.
     """
-    out = dict(bas)
     if exc.reason == "blockerad":
-        out["fel"]  = ("Källan blockerade anropet (HTTP 403). "
-                       "Servern är tillfälligt skyddad av bot-shield.")
-        out["tips"] = ("Försök igen om en stund. Om felet kvarstår är althingi.is "
-                       "temporärt otillgänglig.")
-    elif exc.reason == "404":
-        out["fel"] = ej_hittad_text
-    elif exc.reason.startswith("natverk:"):
-        out["fel"] = f"Nätverksfel mot källan ({exc.reason})."
-    else:
-        out["fel"] = f"Källan svarade med fel ({exc.reason})."
-    return out
+        return ToolError(
+            "Källan blockerade anropet (HTTP 403, bot-shield på althingi.is). "
+            "Försök igen om en stund; kvarstår felet är althingi.is tillfälligt "
+            "otillgänglig."
+        )
+    if exc.reason == "404":
+        return ToolError(ej_hittad_text)
+    if exc.reason.startswith("natverk:"):
+        return ToolError(f"Nätverksfel mot källan ({exc.reason}). Försök igen.")
+    return ToolError(f"Källan svarade med fel ({exc.reason}).")
 
 
 # ── Verktyg ────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
-def is_lista_thing() -> dict:
+@mcp.tool(title="Lista Alþingis riksmöten", annotations=LASNING_EXTERN)
+def is_lista_thing() -> ThingLista:
     """
     Listar alla isländska riksmöten (þing) från Alþingi XML-API.
 
@@ -221,34 +279,27 @@ def is_lista_thing() -> dict:
     thingtok_lykur (slut, kan vara tomt för pågående þing).
 
     Använd thing_nr som indata till is_sok_althingi och is_hamta_dokument.
-    Nuvarande þing: 155 (2024-2025).
     """
     try:
         lista = _thing_lista()
-        return {
-            "thing_antal": len(lista),
-            "thing_lista": lista,
-        }
     except HamtaFel as exc:
         log.error("is_lista_thing HamtaFel: reason=%s status=%s", exc.reason, exc.status)
-        return _fel_fran_hamtafel(exc, {}, "Riksmöteslistan hittades inte hos källan.")
-    except Exception as exc:
-        log.error("is_lista_thing misslyckades: %s", exc)
-        return {"fel": str(exc)}
+        raise _toolerror_fran_hamtafel(exc, "Riksmöteslistan hittades inte hos källan.")
+    return {"thing_antal": len(lista), "thing_lista": lista}
 
 
-@mcp.tool()
+@mcp.tool(title="Sök þingmál i Alþingi", annotations=LASNING_EXTERN)
 def is_sok_althingi(
     fraga: str,
     lthing: Optional[int] = None,
     malstegund: str = "",
     max_treff: int = 20,
-) -> dict:
+) -> AlthingiSok:
     """
     Söker i Alþingis þingmál (ärenden) för ett givet riksmöte.
 
     OBS: Alþingi XML-API har ingen fri-textsökning. Sökningen sker via
-    klient-sidesfiltrering på þingmál-titlar. DB-baserad sökning implementeras
+    klient-sidesfiltrering på þingmál-titlar.
     Hämta fulltext via is_hamta_dokument efter sökning.
 
     Parametrar:
@@ -273,21 +324,17 @@ def is_sok_althingi(
     Använd malnr med is_hamta_dokument för att hämta fullständiga handlingar.
     """
     try:
-        # Hämta känd þing-lista; välj senaste om lthing inte angetts
         thing_lista = _thing_lista()
         kanda_nr    = {t["thing_nr"] for t in thing_lista}
         if lthing is None:
-            lthing = max(kanda_nr, default=157) if kanda_nr else 157
+            lthing = max(kanda_nr) if kanda_nr else 157
         elif lthing not in kanda_nr:
-            return {
-                "fel": f"Okänt þing-nummer: {lthing}. Anropa is_lista_thing för giltiga värden.",
-                "fraga": fraga,
-                "lthing": lthing,
-            }
+            raise ToolError(
+                f"Okänt þing-nummer: {lthing}. Anropa is_lista_thing för giltiga värden."
+            )
 
-        # Eventuell query-expansion
-        expansion   = expandera_fraga(fraga)
-        sok_fraga   = fraga + ("," + ",".join(expansion) if expansion else "")
+        expansion = expandera_fraga(fraga)
+        sok_fraga = fraga + ("," + ",".join(expansion) if expansion else "")
 
         treff = al.sok_thingmal(
             fraga=sok_fraga,
@@ -295,34 +342,26 @@ def is_sok_althingi(
             malstegund=malstegund,
             max_treff=max_treff,
         )
-
-        return {
-            "fraga":       fraga,
-            "expansion":   expansion,
-            "lthing":      lthing,
-            "malstegund":  malstegund,
-            "treff_antal": len(treff),
-            "treff":       treff,
-        }
-
     except HamtaFel as exc:
         log.error("is_sok_althingi HamtaFel (fraga=%r lthing=%s): reason=%s status=%s",
                   fraga, lthing, exc.reason, exc.status)
-        return _fel_fran_hamtafel(
-            exc,
-            {"fraga": fraga, "lthing": lthing},
-            f"Inga þingmál hittades för lthing={lthing}.",
-        )
-    except Exception as exc:
-        log.error("is_sok_althingi misslyckades: %s", exc)
-        return {"fel": str(exc), "fraga": fraga, "lthing": lthing}
+        raise _toolerror_fran_hamtafel(exc, f"Inga þingmál hittades för lthing={lthing}.")
+
+    return {
+        "fraga":       fraga,
+        "expansion":   expansion,
+        "lthing":      lthing,
+        "malstegund":  malstegund,
+        "treff_antal": len(treff),
+        "treff":       treff,
+    }
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta ärendehistorik för ett þingmál", annotations=LASNING_EXTERN)
 def is_hamta_arende(
     lthing: int,
     malnr: int,
-) -> dict:
+) -> dict[str, Any]:
     """
     Hämtar fullständig ärendehistorik för ett þingmál — mål-metadata plus
     samtliga þingskjöl som hör till målet (lagförslag, nefndarálit,
@@ -346,40 +385,28 @@ def is_hamta_arende(
                              i kronologisk ordning. Använd skjalnr som indata till
                              is_hamta_dokument för att läsa specifika skjöl.
 
-    Returnerar {} med 'fel'-nyckel om målet inte hittas.
+    Ger ett fel om målet inte hittas.
 
     Exempel: is_hamta_arende(lthing=155, malnr=1) → fjárlög 2025 + alla skjöl
     """
+    ej_hittad = (f"Þingmál {lthing}/{malnr} hittades inte. Kontrollera lthing och "
+                 "malnr; använd is_sok_althingi för att hitta giltiga mål.")
     try:
         result = al.hamta_thingmal(lthing=lthing, malnr=malnr)
-        if not result:
-            return {
-                "fel":    f"Þingmál {lthing}/{malnr} hittades inte.",
-                "lthing": lthing,
-                "malnr":  malnr,
-                "tips":   "Kontrollera lthing och malnr. Använd is_sok_althingi för att hitta giltiga mål.",
-            }
-        return result
-
     except HamtaFel as exc:
         log.error("is_hamta_arende HamtaFel (lthing=%s malnr=%s): reason=%s status=%s",
                   lthing, malnr, exc.reason, exc.status)
-        return _fel_fran_hamtafel(
-            exc,
-            {"lthing": lthing, "malnr": malnr},
-            f"Þingmál {lthing}/{malnr} hittades inte.",
-        )
-    except Exception as exc:
-        log.error("is_hamta_arende misslyckades (lthing=%s malnr=%s): %s",
-                  lthing, malnr, exc)
-        return {"fel": str(exc), "lthing": lthing, "malnr": malnr}
+        raise _toolerror_fran_hamtafel(exc, ej_hittad)
+    if not result:
+        raise ToolError(ej_hittad)
+    return result
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta ett þingskjal", annotations=LASNING_EXTERN)
 def is_hamta_dokument(
     lthing: int,
     skjalnr: int,
-) -> dict:
+) -> dict[str, Any]:
     """
     Hämtar metadata för ett enskilt þingskjal från Alþingi XML-API.
 
@@ -400,28 +427,16 @@ def is_hamta_dokument(
     Fulltext (HTML) hämtas via html_url. PDF-version via pdf_url.
     URL-mönster: althingi.is/altext/{lthing}/s/{skjalnr:04d}.html
     """
+    ej_hittad = f"Þingskjal {lthing}/{skjalnr} hittades inte."
     try:
         skjal = al.hamta_thingskjal(lthing=lthing, skjalnr=skjalnr)
-        if not skjal:
-            return {
-                "fel":    f"Þingskjal {lthing}/{skjalnr} hittades inte.",
-                "lthing":  lthing,
-                "skjalnr": skjalnr,
-            }
-        return skjal
-
     except HamtaFel as exc:
         log.error("is_hamta_dokument HamtaFel (lthing=%s skjalnr=%s): reason=%s status=%s",
                   lthing, skjalnr, exc.reason, exc.status)
-        return _fel_fran_hamtafel(
-            exc,
-            {"lthing": lthing, "skjalnr": skjalnr},
-            f"Þingskjal {lthing}/{skjalnr} hittades inte.",
-        )
-    except Exception as exc:
-        log.error("is_hamta_dokument misslyckades (lthing=%s skjalnr=%s): %s",
-                  lthing, skjalnr, exc)
-        return {"fel": str(exc), "lthing": lthing, "skjalnr": skjalnr}
+        raise _toolerror_fran_hamtafel(exc, ej_hittad)
+    if not skjal:
+        raise ToolError(ej_hittad)
+    return skjal
 
 
 # ── Lagtext och förordningar ──────────────────────────────────────────────────
@@ -433,25 +448,25 @@ def _parse_beteckning(s: str) -> tuple[int, int]:
 
     Lagar och förordningar har en kombinerad beteckning, t.ex. '33/1944' för
     Stjórnarskráin eller '1008/2011' för en specifik reglugerð. Funktionen
-    accepterar mellanslag runt och vid skiljetecknet. Höjer ValueError om
+    accepterar mellanslag runt och vid skiljetecknet. Kastar ToolError om
     formatet inte matchar.
     """
     import re as _re
     m = _re.fullmatch(r"\s*(\d+)\s*/\s*(\d+)\s*", s)
     if not m:
-        raise ValueError(
+        raise ToolError(
             f"Ogiltig beteckning '{s}'. Förväntat format: 'NR/ÅR' (t.ex. '33/1944')."
         )
     return int(m.group(1)), int(m.group(2))
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta konsoliderad isländsk lag", annotations=LASNING_EXTERN)
 def is_hamta_log(
     beteckning: str,
     version: str = "nuna",
     max_tecken: int = IS_MAX_TECKEN,
     fran_tecken: int = 0,
-) -> dict:
+) -> dict[str, Any]:
     """
     Hämtar en konsoliderad isländsk lag från althingi.is/lagasafn/.
 
@@ -461,199 +476,192 @@ def is_hamta_log(
     provenienshantering — exakt vilken lag som gällde vid en given tidpunkt.
 
     Parametrar:
-      beteckning — Lagens beteckning på formen 'NR/ÅR' (t.ex. '33/1944' för
-                   Stjórnarskrá lýðveldisins Íslands). Matchar fältet
-                   `beteckning` från is_sok_i_dokument-träffar.
-      version    — 'nuna' (gällande version, standard) eller riksmötessuffix
-                   som '157a', '156b', '155', '154a'. Tillgängliga versioner
-                   hämtas via hamta_log_lista_versioner() i lagasafn.py.
+      beteckning  — Lagens beteckning på formen 'NR/ÅR' (t.ex. '33/1944' för
+                    Stjórnarskrá lýðveldisins Íslands). Matchar fältet
+                    `beteckning` från is_sok_i_dokument-träffar.
+      version     — 'nuna' (gällande version, standard) eller riksmötessuffix
+                    som '157a', '156b', '155', '154a'.
+      max_tecken  — Teckentak för lagtexten (standard 60 000). 0 = hela texten.
+      fran_tecken — Börja vid denna position, för att läsa vidare efter ett
+                    kapat svar (se fortsatt_fran_tecken).
 
     Returnerar:
       nr, ar, version, beteckning (t.ex. '33/1944'), titill,
-      fulltext_md (lagtext i markdown), url, tecken_antal.
-    Returnerar {} med 'fel'-nyckel om lagen ej hittas eller beteckningen är ogiltig.
+      fulltext_md (lagtext i markdown), url, tecken_antal, samt
+      tecken_totalt, tecken_visade, trunkerad, fortsatt_fran_tecken.
+    Ger ett fel om lagen inte hittas eller beteckningen är ogiltig.
 
     Exempel: is_hamta_log(beteckning="33/1944") → Stjórnarskrá (grundlagen)
     Exempel: is_hamta_log(beteckning="75/2000") → skipulagslög (plan- och bygglagen)
     """
-    try:
-        nr, ar = _parse_beteckning(beteckning)
-    except ValueError as exc:
-        return {"fel": str(exc), "beteckning": beteckning}
+    nr, ar = _parse_beteckning(beteckning)
+    ej_hittad = (
+        f"Lag {nr}/{ar} (version={version}) hittades inte i lagasafn. Verifiera "
+        "lagnummer och år mot althingi.is/lagasafn/; för semantisk sökning i "
+        "lagtexter, använd is_sok_i_dokument."
+    )
 
     try:
         result = ls.hamta_log(nr=nr, ar=ar, version=version)
-        if not result:
-            return {
-                "fel":        f"Lag {nr}/{ar} (version={version}) hittades inte i lagasafn.",
-                "beteckning": f"{nr}/{ar}",
-                "version":    version,
-                "tips":       "Verifiera lagnummer och år mot listan på althingi.is/lagasafn/. "
-                              "För semantisk sökning i lagtexter, använd is_sok_i_dokument.",
-            }
-
-        # Källan levererar alltid hela lagtexten — trunkeringen gäller bara svaret.
-        for nyckel in ("fulltext_md", "text", "lagtext"):
-            if result.get(nyckel):
-                _u = _skar_ut(result[nyckel], max_tecken, fran_tecken)
-                result[nyckel]                = _u["text"]
-                result["tecken_totalt"]        = _u["tecken_totalt"]
-                result["tecken_visade"]        = _u["tecken_visade"]
-                result["trunkerad"]            = _u["trunkerad"]
-                result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
-                break
-        return result
     except HamtaFel as exc:
-        if exc.reason == "404":
-            return {
-                "fel":        f"Lag {nr}/{ar} (version={version}) hittades inte i lagasafn.",
-                "beteckning": f"{nr}/{ar}",
-                "version":    version,
-                "tips":       "Verifiera lagnummer och år mot listan på althingi.is/lagasafn/. "
-                              "För semantisk sökning i lagtexter, använd is_sok_i_dokument.",
-            }
-        if exc.reason == "blockerad":
-            return {
-                "fel":        f"Källan blockerade anropet (HTTP 403). "
-                              "Servern är tillfälligt skyddad av bot-shield.",
-                "beteckning": f"{nr}/{ar}",
-                "version":    version,
-                "tips":       "Försök igen om en stund. Om felet kvarstår är althingi.is "
-                              "temporärt otillgänglig.",
-            }
-        log.error("is_hamta_log HamtaFel (%s): reason=%s status=%s", beteckning, exc.reason, exc.status)
-        return {
-            "fel":        f"Källan svarade med fel ({exc.reason}).",
-            "beteckning": f"{nr}/{ar}",
-        }
-    except Exception as exc:
-        log.error("is_hamta_log misslyckades (%s): %s", beteckning, exc)
-        return {"fel": str(exc), "beteckning": beteckning}
+        log.error("is_hamta_log HamtaFel (%s): reason=%s status=%s",
+                  beteckning, exc.reason, exc.status)
+        raise _toolerror_fran_hamtafel(exc, ej_hittad)
+    if not result:
+        raise ToolError(ej_hittad)
+
+    # Källan levererar alltid hela lagtexten — trunkeringen gäller bara svaret.
+    for nyckel in ("fulltext_md", "text", "lagtext"):
+        if result.get(nyckel):
+            _u = _skar_ut(result[nyckel], max_tecken, fran_tecken)
+            result[nyckel]                 = _u["text"]
+            result["tecken_totalt"]        = _u["tecken_totalt"]
+            result["tecken_visade"]        = _u["tecken_visade"]
+            result["trunkerad"]            = _u["trunkerad"]
+            result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
+            break
+    return result
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta isländsk förordning", annotations=LASNING_EXTERN)
 def is_hamta_reglugerd(
     beteckning: str,
     version: str = "current",
-) -> dict:
+) -> dict[str, Any]:
     """
     Hämtar metadata och PDF-länk för en isländsk förordning (reglugerð)
     från api.reglugerd.is.
 
-    Täcker förordningar från 1957 till idag. PDF-fulltexten hämtas via pdf_url
-    i svaret.
+    Täcker förordningar från 1957 till idag.
 
     Parametrar:
-      beteckning — Förordningens beteckning på formen 'NR/ÅR' (t.ex. '179/2018'
-                   för Reglugerð um flugvelli). Matchar fältet `name` från
-                   is_sok_reglugerd-träffar.
+      beteckning — Förordningens beteckning på formen 'NR/ÅR' (t.ex. '725/2020').
+                   Matchar fältet `name` från is_sok_reglugerd-träffar.
       version    — 'current' (gällande version med inarbetade ändringar, standard)
                    eller 'original' (ursprungstext som publicerades).
 
     Returnerar:
-      nr, ar, beteckning (t.ex. '179/2018'), version, titill,
-      publicerad, ministerium, pdf_url (direktlänk till fulltext-PDF), url.
-    Returnerar {} med 'fel'-nyckel om förordningen ej hittas eller beteckningen
-    är ogiltig.
+      nr, ar, beteckning, version, titill, publicerad, ministerium (namn),
+      ikrafttradde_vid, signerades_vid, upphavt, upphavt_vid,
+      pdf_url, pdf_typ, webb_url, fullstandig, url, meta_raw.
 
-    Exempel: is_hamta_reglugerd(beteckning="179/2018") → Reglugerð um flugvelli
+    PDF-länken:
+      pdf_typ 'konsoliderad'       — källans PDF med inarbetade ändringar.
+      pdf_typ 'originalkungorelse' — den ursprungliga kungörelsen i
+                                     Stjórnartíðindi (utan senare ändringar).
+      pdf_url null                 — ingen PDF finns via API:t.
+    fullstandig=false betyder att källan bara har titel och länkar för
+    förordningen; `notering` förklarar, och webb_url leder till reglugerd.is.
+    Ger ett fel om förordningen inte finns eller beteckningen är ogiltig.
+
+    Exempel: is_hamta_reglugerd(beteckning="725/2020")
     """
-    try:
-        nr, ar = _parse_beteckning(beteckning)
-    except ValueError as exc:
-        return {"fel": str(exc), "beteckning": beteckning}
-
+    nr, ar = _parse_beteckning(beteckning)
     try:
         result = rg.hamta_reglugerd(nr=nr, ar=ar, version=version)
-        if not result:
-            return {
-                "fel":        f"Förordning {nr}/{ar} (version={version}) hittades inte.",
-                "beteckning": f"{nr}/{ar}",
-                "version":    version,
-                "tips":       "Använd is_sok_reglugerd för att söka efter förordningar.",
-            }
-        return result
     except Exception as exc:
         log.error("is_hamta_reglugerd misslyckades (%s): %s", beteckning, exc)
-        return {"fel": str(exc), "beteckning": beteckning}
+        raise ToolError(f"api.reglugerd.is svarade inte som väntat ({exc}). Försök igen.")
+    if not result:
+        raise ToolError(
+            f"Förordning {nr}/{ar} (version={version}) hittades inte. "
+            "Använd is_sok_reglugerd för att söka efter förordningar."
+        )
+    return result
 
 
-@mcp.tool()
+@mcp.tool(title="Sök isländska förordningar", annotations=LASNING_EXTERN)
 def is_sok_reglugerd(
     fraga: str,
     ar: Optional[int] = None,
     page: int = 1,
     max_treff: int = 20,
-) -> dict:
+) -> ReglugerdSok:
     """
     Söker i isländska förordningar (reglugerðir) via api.reglugerd.is.
 
-    Söker i förordningstitlar och innehåll. API:et har inbyggd fritext-sökning
-    (till skillnad från Alþingi XML-API som saknar det). Täcker 1957–idag.
+    Söker i förordningstitlar och innehåll. Täcker 1957–idag.
 
     Parametrar:
       fraga     — Sökterm på isländska (t.ex. 'umferðarlag', 'skattur', 'fiskveiðar').
-                  Tom sträng returnerar alla förordningar (paginerat).
+                  Tom sträng går bara tillsammans med `ar` (alla förordningar
+                  det året); källan ger inga träffar när båda saknas.
       ar        — Filtrera på publiceringsår (t.ex. 2020). Alla år om None.
-      page      — Sidnummer för paginering (standard 1).
-      max_treff — Max antal träffar per sida (standard 20).
+      page      — Sidnummer (1-baserat), räknat i sidor om max_treff poster.
+      max_treff — Poster per sida, 1–30 (standard 20).
 
     Returnerar:
       fraga, ar, page, per_page, total_sidor, total_antal,
       data: lista med {name, titill, publicerad, ministerium}.
-    Använd name-fältet (t.ex. '179/2018') för att bryta ut nr och ar
-    inför anrop till is_hamta_reglugerd.
+    Använd name-fältet (t.ex. '0179/2018') som beteckning till is_hamta_reglugerd.
 
     Exempel: is_sok_reglugerd('fiskveiðar', ar=2020)
     """
     try:
         return rg.sok_reglugerd(fraga=fraga, ar=ar, page=page, per_page=max_treff)
+    except ValueError as exc:
+        raise ToolError(str(exc))
     except Exception as exc:
         log.error("is_sok_reglugerd misslyckades (fraga=%r): %s", fraga, exc)
-        return {"fel": str(exc), "fraga": fraga}
+        raise ToolError(f"api.reglugerd.is svarade inte som väntat ({exc}). Försök igen.")
 
 
 # ── Rit og skýrslur ───────────────────────────────────────────────────────────
 
 
-def _hamta_rit_fra_db(url: str) -> Optional[dict]:
+def _las_rit_fran_db(url: str) -> tuple[Optional[dict], str]:
     """
-    Returnerar cached dokument_rit-post från lokal DB, eller None.
-    Används av is_hamta_skyrsla för att undvika redundant PDF-hämtning.
+    Slår upp en publikation i lokal DB oavsett vilken URL-form anroparen har.
+
+    Returnerar (post eller None, nyckel-URL). Nyckeln är den URL som posten
+    har, eller ska få, i dokument_rit: den kanoniska /rit/-formen. En äldre
+    /stakt-rit/-URL söks först som den är (databaser där de äldre URL:erna
+    inte har uppdaterats) och annars via webbplatsens omdirigering.
     """
-    try:
-        cols = ("url", "titill", "slug", "dagsetning", "ministerium",
-                "tema", "ar", "dokumenttyp_isl", "pdf_url", "fulltext_md")
-        sql = (
-            f"SELECT {', '.join(cols)} FROM {db_mod._prefix()}dokument_rit "
-            f"WHERE url = {db_mod._ph()}"
-        )
-        with db_mod._cursor() as cur:
-            cur.execute(sql, (url,))
-            row = cur.fetchone()
+    def _las(u: str) -> Optional[dict]:
+        try:
+            return db_mod.hamta_dokument_rit(u)
+        except Exception as exc:
+            log.debug("DB-uppslag misslyckades för %s: %s", u, exc)
+            return None
 
-        return dict(zip(cols, row)) if row else None
-    except Exception as exc:
-        log.debug("_hamta_rit_fra_db misslyckades för %s: %s", url, exc)
-        return None
+    post = _las(url)
+    if post:
+        return post, url
+    nyckel = sr.folj_omdirigering(url) if sr.ar_aldre_url(url) else sr.kanonisk_rit_url(url)
+    if not nyckel:
+        return None, url
+    if nyckel != url:
+        post = _las(nyckel)
+    return post, nyckel
 
 
-@mcp.tool()
+def _trunkera_rit(post: dict, max_tecken: int, fran_tecken: int) -> dict:
+    _u = _skar_ut(post["fulltext_md"], max_tecken, fran_tecken)
+    post["fulltext_md"]          = _u["text"]
+    post["tecken_antal"]         = _u["tecken_visade"]
+    post["tecken_totalt"]        = _u["tecken_totalt"]
+    post["trunkerad"]            = _u["trunkerad"]
+    post["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
+    return post
+
+
+@mcp.tool(title="Sök i regeringspublikationer (rit og skýrslur)", annotations=LASNING_DB)
 def is_sok_skyrslur(
     fraga: str,
     ministerium: str = "",
     ar: Optional[int] = None,
     dokumenttyp: str = "",
     max_treff: int = 20,
-) -> dict:
+) -> SkyrslurSok:
     """
     Söker i isländska regeringspublikationer (rit og skýrslur) från
     stjornarradid.is via lokal fulltextindexering.
 
     OBS: Sajtens egna sökmotor är trasig (alla termer → 0 träffar). Sökning
-    sker alltid mot lokal DB (island.dokument_rit). Kör synka_rit() i
-    stjornarradid_rit.py för att fylla DB med data. Täckning: 380 publikationer
-    2021-2026. Äldre publikationer (2007-2020) är utanför scope för v1.
+    sker alltid mot lokal DB (island.dokument_rit), som fylls av den dagliga
+    synken. Listningen på stjornarradid.is går tillbaka till 1991; täckningen
+    lokalt beror på hur långt synken hunnit.
 
     Parametrar:
       fraga       — Sökterm på isländska. Kommaseparerade ord = OR-logik.
@@ -663,8 +671,8 @@ def is_sok_skyrslur(
       ar          — Filtrera på publiceringsår (t.ex. 2023). None = alla år.
       dokumenttyp — Filtrera på heuristisk dokumenttyp (t.ex. 'Skýrsla',
                     'Ársskýrsla', 'Greinargerð', 'Hvítbók'). Tom = alla typer.
-                    OBS: Klassificeringen är heuristisk (~38 % täckning) — inte
-                    officiell metadata.
+                    OBS: Klassificeringen är heuristisk efter titelprefix —
+                    inte officiell metadata.
       max_treff   — Max antal träffar (standard 20).
 
     Returnerar:
@@ -674,10 +682,9 @@ def is_sok_skyrslur(
 
     Använd url med is_hamta_skyrsla för att hämta fulltext.
     """
+    expansion = expandera_fraga(fraga)
+    sok_fraga = fraga + ("," + ",".join(expansion) if expansion else "")
     try:
-        expansion  = expandera_fraga(fraga)
-        sok_fraga  = fraga + ("," + ",".join(expansion) if expansion else "")
-
         treff = db_mod.fts_sok_rit(
             fraga       = sok_fraga,
             ministerium = ministerium or None,
@@ -685,28 +692,30 @@ def is_sok_skyrslur(
             dokumenttyp = dokumenttyp or None,
             max_treff   = max_treff,
         )
-
-        return {
-            "fraga":       fraga,
-            "expansion":   expansion,
-            "ministerium": ministerium or None,
-            "ar":          ar,
-            "dokumenttyp": dokumenttyp or None,
-            "treff_antal": len(treff),
-            "treff":       treff,
-        }
-
     except Exception as exc:
         log.error("is_sok_skyrslur misslyckades (fraga=%r): %s", fraga, exc)
-        return {"fel": str(exc), "fraga": fraga}
+        raise ToolError(
+            "Den lokala databasen gick inte att läsa. Kontrollera DATABASE_URL "
+            "och att databasen är igång."
+        )
+
+    return {
+        "fraga":       fraga,
+        "expansion":   expansion,
+        "ministerium": ministerium or None,
+        "ar":          ar,
+        "dokumenttyp": dokumenttyp or None,
+        "treff_antal": len(treff),
+        "treff":       treff,
+    }
 
 
-@mcp.tool()
+@mcp.tool(title="Hämta fulltext för en regeringspublikation", annotations=LASNING_EXTERN)
 def is_hamta_skyrsla(
     url: str,
     max_tecken: int = IS_MAX_TECKEN,
     fran_tecken: int = 0,
-) -> dict:
+) -> dict[str, Any]:
     """
     Hämtar fulltext för en isländsk regeringspublikation (rit og skýrslur).
 
@@ -715,119 +724,113 @@ def is_hamta_skyrsla(
     stjornarradid.is, extraheras med pymupdf4llm och returneras.
 
     Parametrar:
-      url — URL till publikationen på stjornarradid.is.
-                Exempel: 'https://www.stjornarradid.is/stakt-rit/2024/03/15/skyrsla-um-x/'
-                Hämta url från treff-listan i is_sok_skyrslur.
+      url         — URL till publikationen på stjornarradid.is, helst från
+                    treff-listan i is_sok_skyrslur. Exempel:
+                    'https://www.stjornarradid.is/gogn/rit-og-skyrslur/rit/2024-12-12-Endurskodun-a-logum-um-rammaaaetlun-Skyrsla-starfshops/'
+                    Äldre /stakt-rit/-URL:er och /rit/YYYY/MM/DD/-formen tas
+                    också emot.
+      max_tecken  — Teckentak för texten (standard 60 000). 0 = hela texten.
+      fran_tecken — Börja vid denna position, för att läsa vidare efter ett
+                    kapat svar (se fortsatt_fran_tecken).
 
     Returnerar:
-      url, pdf_url, fulltext_md (markdown), tecken_antal, kalla ('db_cache' | 'live').
-      Returnerar {} med 'fel'-nyckel om hämtning misslyckas.
+      url, titill, pdf_url, fulltext_md (markdown), tecken_antal,
+      tecken_totalt, trunkerad, fortsatt_fran_tecken, kalla ('db_cache' | 'live').
+      Ger ett fel om publikationen, PDF:en eller texten inte går att hämta.
 
     PDF-filen lagras INTE lokalt — den laddas ned, extraheras och raderas direkt.
-    Dokumenttyper: Skýrsla, Ársskýrsla, Greinargerð, Hvítbók, Aðgerðaáætlun m.fl.
-    (se is_sok_skyrslur för komplett lista).
     """
+    cached, nyckel = _las_rit_fran_db(url)
+    if cached and cached.get("fulltext_md"):
+        cached["kalla"] = "db_cache"
+        # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
+        return _trunkera_rit(cached, max_tecken, fran_tecken)
+
+    if not sr.kanonisk_rit_url(nyckel):
+        raise ToolError(
+            f"'{url}' är ingen publikations-URL på stjornarradid.is. Hämta url "
+            "ur träfflistan i is_sok_skyrslur."
+        )
+
     try:
-        # Strategi 1: returnera från DB-cache om fulltext redan finns
-        cached = _hamta_rit_fra_db(url)
-        if cached and cached.get("fulltext_md"):
-            cached["kalla"] = "db_cache"
-            # Databasen har alltid hela texten — trunkeringen gäller bara svaret.
-            _u = _skar_ut(cached["fulltext_md"], max_tecken, fran_tecken)
-            cached["fulltext_md"]          = _u["text"]
-            cached["tecken_antal"]         = _u["tecken_visade"]
-            cached["tecken_totalt"]        = _u["tecken_totalt"]
-            cached["trunkerad"]            = _u["trunkerad"]
-            cached["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
-            return cached
-
-        # Strategi 2: hämta live (PDF → markdown)
-        result = sr.hamta_rit_fulltext(url)
-        if result.get("fulltext_md"):
-            result["kalla"] = "live"
-            # Spara i DB för framtida anrop (bäst-möjlig — ingen blockering vid fel)
-            try:
-                if cached:
-                    # Post finns men saknade fulltext — uppdatera
-                    sr._uppdatera_fulltext(
-                        db_mod, url,
-                        result["pdf_url"],
-                        result["fulltext_md"],
-                    )
-                else:
-                    # Post saknas helt — upsert minimal metadata
-                    m = sr._STAKT_RIT_RE.search(url)
-                    if m:
-                        ar_str, mm_str, dd_str, slug = m.groups()
-                        db_mod.upsert_dokument_rit(
-                            url             = url,
-                            titill          = slug.replace("-", " ").capitalize(),
-                            slug            = slug,
-                            dagsetning      = f"{ar_str}-{mm_str}-{dd_str}",
-                            ministerium     = None,
-                            tema            = None,
-                            ar              = int(ar_str),
-                            dokumenttyp_isl = None,
-                            pdf_url         = result["pdf_url"],
-                            fulltext_md     = result["fulltext_md"],
-                        )
-            except Exception as exc:
-                log.debug("DB-cache för %s misslyckades (icke-kritiskt): %s",
-                          url, exc)
-
-        if result.get("fulltext_md"):
-            _u = _skar_ut(result["fulltext_md"], max_tecken, fran_tecken)
-            result["fulltext_md"]          = _u["text"]
-            result["tecken_antal"]         = _u["tecken_visade"]
-            result["tecken_totalt"]        = _u["tecken_totalt"]
-            result["trunkerad"]            = _u["trunkerad"]
-            result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
-
-        return result
-
+        result = sr.hamta_rit_fulltext(nyckel)
     except Exception as exc:
         log.error("is_hamta_skyrsla misslyckades (%s): %s", url, exc)
-        return {"fel": str(exc), "url": url}
+        raise ToolError(f"Hämtningen från stjornarradid.is misslyckades ({exc}).")
+    if result.get("fel"):
+        raise ToolError(f"{result['fel']} ({result.get('url') or nyckel})")
+
+    result["kalla"] = "live"
+    # Spara i DB för framtida anrop. Ett fel här stoppar inte svaret.
+    try:
+        if cached:
+            sr._uppdatera_fulltext(db_mod, nyckel, result["pdf_url"], result["fulltext_md"])
+        else:
+            slug, dagsetning = sr._slug_och_datum(nyckel)
+            titill = result.get("titill") or slug.replace("-", " ")
+            db_mod.upsert_dokument_rit(
+                url             = nyckel,
+                titill          = titill,
+                slug            = slug,
+                dagsetning      = dagsetning,
+                ministerium     = None,
+                tema            = None,
+                ar              = int(dagsetning[:4]) if dagsetning else None,
+                dokumenttyp_isl = sr.extrahera_dokumenttyp(titill),
+                pdf_url         = result["pdf_url"],
+                fulltext_md     = result["fulltext_md"],
+            )
+    except Exception as exc:
+        log.debug("DB-cache för %s misslyckades (icke-kritiskt): %s", nyckel, exc)
+
+    return _trunkera_rit(result, max_tecken, fran_tecken)
 
 
 # ── Embeddingmodell ────────────────────────────────────────────────────────────
 
 def _hamta_embedding_modell():
     """
-    Laddar intfloat/multilingual-e5-base lazily (768 dim).
-    Skyddar FD 1 mot tqdm/transformers-utskrifter som annars kraschar MCP stdio.
+    Laddar intfloat/multilingual-e5-base lat (768 dim), en gång per process.
+
+    Dubbelkontrollerad låsning: verktygen körs på arbetstrådar, och utan låset
+    kunde två samtidiga första anrop ladda modellen var för sig. Utskrifter
+    från tqdm/transformers under inläsningen leds till logs/embedding.log.
     """
     global _embedding_modell
     if _embedding_modell is not None:
         return _embedding_modell
 
-    log_sokvag = _SCRIPT_DIR / "logs" / "embedding.log"
-    log_sokvag.parent.mkdir(parents=True, exist_ok=True)
-    log_fd   = os.open(str(log_sokvag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    save_fd1 = os.dup(1)
-    try:
-        os.dup2(log_fd, 1)
-        from sentence_transformers import SentenceTransformer
-        _embedding_modell = SentenceTransformer(EMBEDDING_MODEL)
-    finally:
-        os.dup2(save_fd1, 1)
-        os.close(save_fd1)
-        os.close(log_fd)
+    with _embedding_las:
+        if _embedding_modell is not None:
+            return _embedding_modell
+        log_sokvag = _SCRIPT_DIR / "logs" / "embedding.log"
+        log_sokvag.parent.mkdir(parents=True, exist_ok=True)
+        log_fd   = os.open(str(log_sokvag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        save_fd1 = os.dup(1)
+        try:
+            os.dup2(log_fd, 1)
+            from sentence_transformers import SentenceTransformer
+            _embedding_modell = SentenceTransformer(EMBEDDING_MODEL)
+        finally:
+            os.dup2(save_fd1, 1)
+            os.close(save_fd1)
+            os.close(log_fd)
 
     return _embedding_modell
 
 
-@mcp.tool()
+@mcp.tool(title="Semantisk sökning i isländska dokument", annotations=LASNING_DB)
 def is_sok_i_dokument(
     fraga: str,
     tabell: str = "alla",
     max_treff: int = 10,
-) -> dict:
+) -> SemantiskSok:
     """
     Semantisk sökning i indexerade isländska dokument via pgvector.
 
     Söker i embeddings genererade med intfloat/multilingual-e5-base (768 dim).
-    Kräver PostgreSQL + pgvector. Vid SQLite-backend returneras FTS-fallback.
+    Kräver PostgreSQL + pgvector. Med SQLite-backend görs fulltextsökning i
+    stället (kalla='fts_fallback').
 
     Parametrar:
       fraga    — Sökfråga på valfritt språk (isländska, svenska, engelska)
@@ -836,103 +839,54 @@ def is_sok_i_dokument(
       max_treff — Max antal träffar per tabell (standard 10)
 
     Returnerar:
-      fraga, expansion (LLM-genererade tilläggstermer), tabell, dokument-träffar
-      och rit-träffar — varje träff innehåller chunk-text, likhetspoäng och metadata.
+      fraga, expansion (LLM-genererade tilläggstermer), tabell, kalla,
+      dokument-träffar och rit-träffar — varje träff innehåller chunk-text,
+      likhetspoäng och metadata.
     """
-    try:
-        expansion = expandera_fraga(fraga)
-        sok_fraga = fraga
-        if expansion:
-            sok_fraga = fraga + ", " + ", ".join(expansion)
+    if tabell not in ("alla", "dokument", "rit"):
+        raise ToolError("tabell ska vara 'alla', 'dokument' eller 'rit'.")
 
+    expansion = expandera_fraga(fraga)
+    sok_fraga = fraga + (", " + ", ".join(expansion) if expansion else "")
+
+    try:
         if not db_mod._ar_postgres():
             # SQLite-backend stöder inte pgvector — använd FTS istället
             log.info("is_sok_i_dokument: SQLite-backend — använder FTS")
             dok_treff = db_mod.fts_sok(sok_fraga, max_treff=max_treff) if tabell in ("alla", "dokument") else []
             rit_treff = db_mod.fts_sok_rit(sok_fraga, max_treff=max_treff) if tabell in ("alla", "rit") else []
-            return {
-                "fraga":       fraga,
-                "expansion":   expansion,
-                "tabell":      tabell,
-                "kalla":       "fts_fallback",
-                "dokument":    dok_treff,
-                "rit":         rit_treff,
-            }
-
-        # PostgreSQL: vektor-sökning
-        modell = _hamta_embedding_modell()
-
-        log_sokvag = _SCRIPT_DIR / "logs" / "embedding.log"
-        log_fd   = os.open(str(log_sokvag), os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-        save_fd1 = os.dup(1)
-        try:
-            os.dup2(log_fd, 1)
-            embedding = modell.encode(
+            kalla = "fts_fallback"
+        else:
+            # stdio-transporten leder om fd 1 bort från protokollströmmen, så
+            # eventuella utskrifter från encode() kan inte störa svaret.
+            embedding = _hamta_embedding_modell().encode(
                 sok_fraga,
                 normalize_embeddings=True,
                 show_progress_bar=False,
             ).tolist()
-        finally:
-            os.dup2(save_fd1, 1)
-            os.close(save_fd1)
-            os.close(log_fd)
-
-        dok_treff: list[dict] = []
-        rit_treff: list[dict] = []
-
-        if tabell in ("alla", "dokument"):
-            dok_treff = db_mod.vektor_sok(embedding, tabell="chunks", max_treff=max_treff)
-
-        if tabell in ("alla", "rit"):
-            rit_treff = db_mod.vektor_sok(embedding, tabell="chunks_rit", max_treff=max_treff)
-
-        return {
-            "fraga":       fraga,
-            "expansion":   expansion,
-            "tabell":      tabell,
-            "kalla":       "pgvector",
-            "dokument":    dok_treff,
-            "rit":         rit_treff,
-        }
-
+            dok_treff = (db_mod.vektor_sok(embedding, tabell="chunks", max_treff=max_treff)
+                         if tabell in ("alla", "dokument") else [])
+            rit_treff = (db_mod.vektor_sok(embedding, tabell="chunks_rit", max_treff=max_treff)
+                         if tabell in ("alla", "rit") else [])
+            kalla = "pgvector"
     except Exception as exc:
         log.error("is_sok_i_dokument misslyckades ('%s'): %s", fraga, exc)
-        return {"fel": str(exc), "fraga": fraga}
+        raise ToolError(
+            "Sökningen misslyckades. Kontrollera att databasen är igång och "
+            f"att embeddingmodellen går att läsa in ({type(exc).__name__})."
+        )
+
+    return {
+        "fraga":     fraga,
+        "expansion": expansion,
+        "tabell":    tabell,
+        "kalla":     kalla,
+        "dokument":  dok_treff,
+        "rit":       rit_treff,
+    }
 
 
 # ── Serverstart ────────────────────────────────────────────────────────────────
 
-def main():
-    log.info("Island MCP-server startar (transport=%s)", MCP_TRANSPORT)
-
-    # Initiera databas (skapar schema + tabeller om de saknas).
-    # initiera_schema() loggar och returnerar tyst om DB är otillgänglig.
-    initiera_schema()
-
-    if MCP_TRANSPORT == "http":
-        import uvicorn
-        from mcp.server.fastmcp import create_starlette_app
-
-        app = create_starlette_app(mcp._mcp_server, debug=False)
-
-        if MCP_API_KEY:
-            from starlette.middleware.base import BaseHTTPMiddleware
-            from starlette.responses import Response as StarletteResponse
-
-            class BearerAuthMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request, call_next):
-                    auth = request.headers.get("Authorization", "")
-                    if not auth.startswith("Bearer ") or auth[7:] != MCP_API_KEY:
-                        return StarletteResponse("Unauthorized", status_code=401)
-                    return await call_next(request)
-
-            app.add_middleware(BearerAuthMiddleware)
-            log.info("Bearer-token-autentisering aktiverad")
-
-        uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="warning")
-    else:
-        mcp.run(transport="stdio")
-
-
 if __name__ == "__main__":
-    main()
+    starta(mcp, standardport=STANDARDPORT, initiera=initiera_schema)

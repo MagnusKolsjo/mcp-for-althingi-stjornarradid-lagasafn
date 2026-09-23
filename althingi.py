@@ -33,6 +33,7 @@ Historisk täckning:
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -79,6 +80,7 @@ def _impersonate_profil() -> str:
 # Token-bucket för crawl-delay
 _bucket_tokens  = 1.0
 _bucket_last_ts = time.monotonic()
+_takt_las       = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -86,20 +88,27 @@ _bucket_last_ts = time.monotonic()
 # ---------------------------------------------------------------------------
 
 def _throttle():
-    """Respekterar Crawl-delay: 5 via token-bucket."""
+    """
+    Respekterar Crawl-delay: 5 via token-bucket.
+
+    Verktygen körs på arbetstrådar. Låset gör läsning och uppdatering av
+    hinken atomär, och väntan inne i låset håller takten även när flera
+    anrop pågår samtidigt.
+    """
     global _bucket_tokens, _bucket_last_ts
-    now     = time.monotonic()
-    elapsed = now - _bucket_last_ts
-    # En token per CRAWL_DELAY sekunder
-    _bucket_tokens   = min(1.0, _bucket_tokens + elapsed / CRAWL_DELAY)
-    _bucket_last_ts  = now
-    if _bucket_tokens < 1.0:
-        sleep_s = (1.0 - _bucket_tokens) * CRAWL_DELAY
-        log.debug("Crawl-delay: väntar %.1f s", sleep_s)
-        time.sleep(sleep_s)
-        _bucket_tokens = 0.0
-    else:
-        _bucket_tokens -= 1.0
+    with _takt_las:
+        now     = time.monotonic()
+        elapsed = now - _bucket_last_ts
+        # En token per CRAWL_DELAY sekunder
+        _bucket_tokens   = min(1.0, _bucket_tokens + elapsed / CRAWL_DELAY)
+        _bucket_last_ts  = now
+        if _bucket_tokens < 1.0:
+            sleep_s = (1.0 - _bucket_tokens) * CRAWL_DELAY
+            log.debug("Crawl-delay: väntar %.1f s", sleep_s)
+            time.sleep(sleep_s)
+            _bucket_tokens = 0.0
+        else:
+            _bucket_tokens -= 1.0
 
 
 def _get_xml(endpoint: str, params: Optional[dict] = None) -> etree._Element:

@@ -12,8 +12,9 @@ Claude och andra MCP-kompatibla AI-assistenter:
 - **Reglugerð** — isländska förordningar via `api.reglugerd.is`. Officiellt
   REST-API drivet av Stafrænt Ísland. Täckning 1957 till idag.
 - **Stjórnarráðið rit og skýrslur** — regeringspublikationer (rapporter,
-  utredningar, åtgärdsplaner) från `stjornarradid.is`. 380 publikationer
-  2021–2026, lokalt indexerade eftersom sajtens egen sökmotor är trasig.
+  utredningar, åtgärdsplaner) från `stjornarradid.is`. Webbplatsens listning
+  omfattar omkring 780 publikationer 1991–idag; de indexeras lokalt eftersom
+  sajtens egen sökmotor är trasig.
 
 ## Funktion
 
@@ -39,7 +40,7 @@ sentence-transformer finns idag.
 | `is_hamta_dokument` | Hämtar metadata för ett enskilt þingskjal |
 | `is_hamta_log` | Hämtar konsoliderad isländsk lag från lagasafn |
 | `is_sok_reglugerd` | Söker i isländska förordningar via api.reglugerd.is |
-| `is_hamta_reglugerd` | Hämtar metadata och PDF-länk för en enskild förordning |
+| `is_hamta_reglugerd` | Hämtar metadata och PDF-länk för en enskild förordning (konsoliderad PDF när källan har en) |
 | `is_sok_skyrslur` | FTS-sökning i regeringspublikationer (rit og skýrslur) |
 | `is_hamta_skyrsla` | Hämtar fulltext för en publikation (DB-cache → live PDF) |
 | `is_sok_i_dokument` | Semantisk sökning via pgvector (multilingual-e5-base) |
@@ -53,7 +54,8 @@ sentence-transformer finns idag.
    cd mcp-for-althingi-stjornarradid-lagasafn
    ```
 
-2. Skapa Python-venv och installera beroenden:
+2. Skapa Python-venv och installera beroenden (kräver Python 3.10+ och
+   `mcp` 2.x, som `requirements.txt` anger):
 
    ```bash
    python3 -m venv .venv
@@ -101,6 +103,28 @@ synkskript:
 03:00. Den hämtar nya regeringspublikationer från stjornarradid.is, kör
 chunkning och embedding för nya dokument och rensar gamla loggar.
 
+Rit-steget (`stjornarradid_rit.py`) går igenom webbplatsens listning
+(`/gogn/rit-og-skyrslur/?index=N`), lägger in metadata och extraherar PDF:er
+för poster som saknar fulltext. En tom listning ger exitkod 1, så att en
+ändrad webbplats syns i loggen. Första körningen efter en tom databas hämtar
+alla publikationer med 5 s mellan anropen och tar därför länge.
+
+### Äldre publikations-URL:er
+
+Publikationer som lagrats med webbplatsens äldre adressform
+(`/gogn/rit-og-skyrslur/stakt-rit/ÅÅÅÅ/MM/DD/slug/`) flyttas till den
+nuvarande (`/gogn/rit-og-skyrslur/rit/ÅÅÅÅ-MM-DD-slug/`) genom att
+webbplatsens omdirigering följs. Poster som synken redan lagt in under den nya
+adressen slås ihop med de gamla, utan att fulltext eller chunks går förlorade.
+Uppdateringen är idempotent och körs automatiskt i varje synk; den kan också
+köras separat:
+
+```bash
+python3 stjornarradid_rit.py --uppdatera-urler
+```
+
+`is_hamta_skyrsla` tar emot båda adressformerna.
+
 Generera och installera launchd-schema automatiskt:
 
 ```bash
@@ -117,9 +141,12 @@ installation. Båda valen är symmetriska, inget är "fallback".
   parallella anslutningar. Kräver Docker eller lokal Postgres-installation.
 - **SQLite** (enkel att komma igång): en lokal fil, ingen serverprocess.
   Vektorsökning kräver Postgres — den faller då tillbaka till FTS.
-- **stdio**: standard. Claude Desktop startar servern direkt.
-- **http**: hostad drift med Bearer-tokenautentisering. Konfigureras via
-  `MCP_TRANSPORT=http` i `.env`.
+- **stdio**: MCP-klienten startar servern direkt.
+- **http**: delad drift (Streamable HTTP på `/mcp`, standardport 8006) med
+  Bearer-tokenautentisering. Konfigureras via `MCP_TRANSPORT=http` i `.env`.
+  `MCP_API_KEY` är obligatorisk: utan nyckel avbryts uppstarten med
+  exitkod 2. Klienten skickar `Authorization: Bearer <nyckel>`; saknad header
+  ger 401 och fel nyckel 403.
 
 ## Känd begränsning — Alþingi-verktygen returnerar HTTP 403
 
@@ -160,6 +187,22 @@ ALTHINGI_USER_AGENT=<Safaris exakta User-Agent>
 i `.env`. Klienten väljer då Safari-fingerprint automatiskt. Lyckas inte
 universellt — fungerar i vissa konfigurationer.
 
+
+## Fel och svarsformat
+
+Verktygen returnerar strukturerade svar med utdataschema. Förväntade fel —
+okänd beteckning, publikation som inte finns, källan svarar inte, databasen
+är nere — ges som MCP-fel (`isError`) med ett meddelande på svenska, inte som
+ett svar med `fel`-nyckel.
+
+`is_hamta_reglugerd`: api.reglugerd.is har för en del förordningar bara
+titel och länkar. Svaret har då `fullstandig: false`, `webb_url` till
+reglugerd.is och en `notering`. `pdf_url` är källans konsoliderade PDF
+(`pdf_typ: "konsoliderad"`), annars den ursprungliga kungörelsen i
+Stjórnartíðindi (`"originalkungorelse"`), annars `null`.
+
+`is_sok_reglugerd`: källan har fast sidstorlek 30; `max_treff` (1–30) och
+`page` räknas om därefter. En sökning kräver sökterm eller år.
 
 ## Svarsstorlek och trunkering
 

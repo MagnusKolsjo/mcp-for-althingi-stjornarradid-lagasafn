@@ -36,7 +36,11 @@ tillämpar [Semantic Versioning](https://semver.org/).
 - **Brytande:** `is_hamta_reglugerd` — `ministerium` är alltid namnet som
   sträng (tidigare ibland objektet `{slug, name}`). `pdf_url` kan vara `null`.
 - **Brytande:** `is_sok_reglugerd` — sökning utan både sökterm och år avvisas
-  (källan gav då alltid 0 träffar). `max_treff` gäller nu, 1–30.
+  (källan gav då alltid 0 träffar). `max_treff` gäller nu, 1–30. Som standard
+  ingår nu ändringsförordningar och upphävda förordningar, vilket ger fler
+  träffar än tidigare.
+- `02_synka_reglugerd.py` hämtar förordningarna med text via
+  `/regulations/all/current/full` i stället för metadata år för år.
 - Alla verktyg har titel, annotationer (läsande; öppen eller sluten värld)
   och utdataschema.
 - Stjórnarráðið hämtas med vanlig HTTP-klient och projektets User-Agent;
@@ -47,6 +51,19 @@ tillämpar [Semantic Versioning](https://semver.org/).
   på arbetstrådar.
 
 ### Tillagt
+
+- `is_hamta_reglugerd` returnerar förordningens text (`text_md`, markdown ur
+  källans `text`-fält med bilagor), kapad med `max_tecken`/`fran_tecken` och
+  `las_vidare` som övriga hämtverktyg. Saknar källans detaljsvar text används
+  den lokala kopian (`text_kalla`).
+- `is_sok_reglugerd`: parametrarna `med_andringsforordningar` och
+  `med_upphavda` (källans `iA`/`iR`), båda True som standard så att sökningen
+  täcker hela samlingen. Tidigare söktes bara gällande grundförordningar.
+- Förordningar ingår i den semantiska sökningen: `02_synka_reglugerd.py`
+  hämtar alla förordningar med text i ett anrop och lagrar texten; ändrad
+  text gör att chunks byggs om.
+- `04_rensa_reglugerd.py [--torrkorning]`: nollställer okontrollerade
+  PDF-länkar som äldre synkar lagrade för förordningar.
 
 - `stjornarradid_rit.py --uppdatera-urler [--torrkorning]`: flyttar lagrade
   publikationer från webbplatsens äldre `/stakt-rit/`-adresser till de

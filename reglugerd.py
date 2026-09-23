@@ -8,13 +8,21 @@ Officiellt REST-API drivet av Digital Iceland (Stafrænt Ísland) under
 isländska finansdepartementet. Källkod öppen (MIT): github.com/island-is/regulations
 
 Bas-URL: https://api.reglugerd.is/api/v1/
-Format:  JSON (metadata), PDF (fulltext)
+Format:  JSON. Fulltexten finns som HTML i fältet `text` (detaljsvaret och
+         bulkhämtningen); PDF är ett alternativt format, inte den enda källan.
 Server:  Fastify (ingen Swagger/OpenAPI-dokumentation exponerad)
 
 Bekräftade endpoints:
   GET /api/v1/years                              — lista år (1957–2026)
   GET /api/v1/ministries                         — lista 16 ministerier
-  GET /api/v1/search                             — sökning, paginerat JSON
+  GET /api/v1/search                             — Elasticsearch-sökning över
+      title, text och text.stemmed (isländsk stamning), paginerat JSON.
+      q = fritext (query_string-syntax), year/yearTo, rn = ministerium-slug,
+      ch = lagkapitel-slug, iA=true tar med ändringsförordningar,
+      iR=true tar med upphävda. Utan iA/iR söker källan bara gällande
+      grundförordningar.
+  GET /api/v1/regulations/all/current/full       — alla förordningar med
+      metadata och `text` (HTML) i ett svar (~6 200 poster, ~57 MB)
   GET /api/v1/regulation/{nr-ar}/{version}/      — metadata för en förordning
   GET /api/v1/regulation/{nr-ar}/{version}/pdf/  — PDF-fulltext (bara för
       förordningar vars detaljsvar har pdfVersion; övriga ger 404)
@@ -37,6 +45,7 @@ URL-format för enskilda förordningar:
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -120,21 +129,122 @@ def ministerium_namn(varde) -> str:
     Returnerar ministeriets namn oavsett format. Sökresultaten har en sträng,
     detaljsvaret ett objekt {slug, name}, och fältet kan saknas helt.
     """
+    if isinstance(varde, str) and varde.startswith("{"):
+        # Bulksvaret har objektet som Python-repr, t.ex. "{'slug': 'urn', 'name': '…'}"
+        try:
+            import ast
+            varde = ast.literal_eval(varde)
+        except (ValueError, SyntaxError):
+            pass
     if isinstance(varde, dict):
         return str(varde.get("name") or varde.get("slug") or "")
     return str(varde or "")
 
 
 # ---------------------------------------------------------------------------
+# HTML → markdown
+# ---------------------------------------------------------------------------
+
+_BLOCK = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "tr", "section",
+          "div", "table", "ol", "ul", "hr", "thead", "tbody"}
+
+
+def html_till_markdown(html: str) -> str:
+    """
+    Gör förordningstextens HTML till läsbar markdown.
+
+    Källans HTML har ett ord per rad; blanktecken inom ett block slås därför
+    ihop till ett mellanslag. Rubriker blir #-rubriker, listpunkter "- ",
+    tabellrader celler åtskilda med " | ". Inline-markering (em, strong, sup)
+    blir ren text.
+    """
+    if not html or not html.strip():
+        return ""
+    from lxml import html as lhtml
+
+    try:
+        rot = lhtml.fragment_fromstring(html, create_parent="div")
+    except Exception:
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+    rader: list[str] = []
+
+    def text_av(el) -> str:
+        delar = []
+        for t in el.itertext():
+            delar.append(t)
+        return re.sub(r"\s+", " ", "".join(delar)).strip()
+
+    def besok(el) -> None:
+        tagg = el.tag if isinstance(el.tag, str) else ""
+        if tagg in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            t = text_av(el)
+            if t:
+                rader.append("#" * int(tagg[1]) + " " + t)
+            return
+        if tagg == "p":
+            # <br> inom stycket blir radbrytning
+            for br in el.iter("br"):
+                br.tail = "\n" + (br.tail or "")
+            stycke = "\n".join(
+                re.sub(r"[ \t\r\f\v]+", " ", r).strip()
+                for r in re.sub(r"[ \t]*\n[ \t]*(?=\S)", " ", "".join(el.itertext())).split("\n")
+            ).strip()
+            stycke = re.sub(r" {2,}", " ", stycke)
+            if stycke:
+                rader.append(stycke)
+            return
+        if tagg == "li":
+            t = text_av(el)
+            if t:
+                rader.append("- " + t)
+            return
+        if tagg == "tr":
+            celler = [text_av(c) for c in el if isinstance(c.tag, str) and c.tag in ("td", "th")]
+            if any(celler):
+                rader.append("| " + " | ".join(celler) + " |")
+            return
+        if tagg == "hr":
+            rader.append("---")
+            return
+        if tagg in _BLOCK or tagg == "div" or tagg == "":
+            if el.text and el.text.strip():
+                rader.append(re.sub(r"\s+", " ", el.text).strip())
+            for barn in el:
+                besok(barn)
+                if barn.tail and barn.tail.strip():
+                    rader.append(re.sub(r"\s+", " ", barn.tail).strip())
+            return
+        t = text_av(el)
+        if t:
+            rader.append(t)
+
+    besok(rot)
+    # Tabellrader hålls ihop; övriga block skiljs med en tomrad.
+    ut = ""
+    for i, rad in enumerate(rader):
+        if i:
+            ut += "\n" if rad.startswith("|") and rader[i - 1].startswith("|") else "\n\n"
+        ut += rad
+    return ut.strip()
+
+
+# ---------------------------------------------------------------------------
 # Sökning
 # ---------------------------------------------------------------------------
 
-def _sok_sida(fraga: str, ar: Optional[int], api_sida: int) -> dict:
+def _sok_sida(fraga: str, ar: Optional[int], api_sida: int,
+              med_andringsforordningar: bool, med_upphavda: bool) -> dict:
     params: dict = {"page": api_sida}
     if fraga:
         params["q"] = fraga
     if ar is not None:
         params["year"] = ar
+    # Källan tolkar bara exakt 'true'; utelämnad flagga betyder "ta inte med".
+    if med_andringsforordningar:
+        params["iA"] = "true"
+    if med_upphavda:
+        params["iR"] = "true"
     svar = _get("search", params=params)
     return svar if isinstance(svar, dict) else {}
 
@@ -144,9 +254,17 @@ def sok_reglugerd(
     ar: Optional[int] = None,
     page: int = 1,
     per_page: int = 20,
+    med_andringsforordningar: bool = True,
+    med_upphavda: bool = True,
 ) -> dict:
     """
-    Söker i isländska förordningar via /api/v1/search.
+    Söker i isländska förordningar via /api/v1/search (Elasticsearch över
+    titel och fulltext, med isländsk stamning).
+
+    Som standard tas ändringsförordningar (iA) och upphävda förordningar (iR)
+    med, så att sökningen täcker hela samlingen. Källan skulle annars bara
+    söka bland gällande grundförordningar. Sätt flaggorna till False för att
+    begränsa.
 
     Källan har en fast sidstorlek på 30 och ignorerar perPage. Sidindelningen
     här räknas därför om: sida `page` med `per_page` poster motsvarar poster
@@ -183,7 +301,7 @@ def sok_reglugerd(
     poster: list[dict] = []
     total_antal = 0
     for api_sida in range(api_forsta, api_sista + 1):
-        svar = _sok_sida(fraga, ar, api_sida)
+        svar = _sok_sida(fraga, ar, api_sida, med_andringsforordningar, med_upphavda)
         # totalItems är 0 för sidor bortom slutet; första svarets värde gäller
         if api_sida == api_forsta or not total_antal:
             total_antal = max(total_antal, int(svar.get("totalItems") or 0))
@@ -203,6 +321,8 @@ def sok_reglugerd(
     return {
         "fraga":       fraga,
         "ar":          ar,
+        "med_andringsforordningar": med_andringsforordningar,
+        "med_upphavda": med_upphavda,
         "page":        page,
         "per_page":    per_page,
         "total_sidor": -(-total_antal // per_page) if total_antal else 0,
@@ -215,12 +335,27 @@ def sok_reglugerd(
 # Enskild förordning
 # ---------------------------------------------------------------------------
 
-# Fält som redovisas separat och därför inte upprepas i meta_raw.
+# Fält som redovisas separat och därför inte upprepas i meta_raw. text och
+# appendixes är HTML och redovisas som markdown i text_md.
 _SEPARATA_FALT = {
     "title", "name", "publishedDate", "ministry", "effectiveDate",
     "signatureDate", "repealed", "repealedDate", "pdfVersion", "originalDoc",
-    "redirectUrl",
+    "redirectUrl", "text", "appendixes",
 }
+
+
+def _bilagor_som_markdown(bilagor) -> str:
+    """Bilagor (appendixes) som markdown, var och en under en egen rubrik."""
+    delar = []
+    for b in bilagor or []:
+        if isinstance(b, dict):
+            titel = re.sub(r"\s+", " ", str(b.get("title") or "")).strip()
+            text  = html_till_markdown(str(b.get("text") or ""))
+        else:
+            titel, text = "", html_till_markdown(str(b))
+        if titel or text:
+            delar.append(f"## Viðauki{': ' + titel if titel else ''}\n\n{text}".strip())
+    return "\n\n".join(delar)
 
 
 def hamta_reglugerd(nr: int, ar: int, version: str = "current") -> dict:
@@ -237,10 +372,14 @@ def hamta_reglugerd(nr: int, ar: int, version: str = "current") -> dict:
     PDF-länken byggs aldrig själv: pdf_url är pdfVersion, annars originalDoc,
     annars None, och pdf_typ säger vilken ('konsoliderad', 'originalkungorelse').
 
+    Fulltexten tas ur detaljsvarets `text` (HTML) och bilagorna ur
+    `appendixes`, omvandlade till markdown i text_md. Kortsvaret har ingen
+    text; text_md är då None.
+
     Returnerar dict med:
       nr, ar, beteckning, version, titill, publicerad, ministerium,
       ministerium_okant, ikrafttradde_vid, signerades_vid, upphavt, upphavt_vid,
-      pdf_url, pdf_typ, webb_url, fullstandig, url, meta_raw
+      pdf_url, pdf_typ, webb_url, fullstandig, url, text_md, meta_raw
       (+ notering för kortsvar).
     Returnerar {} om förordningen inte finns (404). Andra fel kastas.
     """
@@ -263,6 +402,10 @@ def hamta_reglugerd(nr: int, ar: int, version: str = "current") -> dict:
         pdf_url, pdf_typ = None, None
 
     ministerium = ministerium_namn(meta.get("ministry"))
+    text_md = html_till_markdown(meta.get("text") or "")
+    bilagor = _bilagor_som_markdown(meta.get("appendixes"))
+    if bilagor:
+        text_md = f"{text_md}\n\n{bilagor}".strip()
     svar = {
         "nr":                nr,
         "ar":                ar,
@@ -282,14 +425,47 @@ def hamta_reglugerd(nr: int, ar: int, version: str = "current") -> dict:
                              or f"https://www.reglugerd.is/reglugerdir/allar/nr/{nr_ar}",
         "fullstandig":       fullstandig,
         "url":               url,
+        "text_md":           text_md or None,
         "meta_raw":          {k: v for k, v in meta.items() if k not in _SEPARATA_FALT},
     }
     if not fullstandig:
         svar["notering"] = (
-            "Källan har bara titel och länkar för denna förordning (ingen "
-            "strukturerad text och ingen konsoliderad PDF). "
+            "Källans detaljsvar har bara titel och länkar för denna förordning "
+            "(ingen text och ingen konsoliderad PDF). "
             + ("pdf_url är den ursprungliga kungörelsen i Stjórnartíðindi. "
                if pdf_url else "Ingen PDF finns via API:t. ")
             + "Läs gällande lydelse på webb_url."
         )
     return svar
+
+
+# ---------------------------------------------------------------------------
+# Bulkhämtning för den lokala sökcachen
+# ---------------------------------------------------------------------------
+
+def hamta_alla_med_text() -> list[dict]:
+    """
+    Hämtar alla förordningar med text i ett anrop via
+    /api/v1/regulations/all/current/full (~6 200 poster, ~57 MB).
+
+    Bulksvaret har text även för förordningar vars detaljsvar är ett kortsvar.
+
+    Returnerar lista med dict: name, titill, publicerad, ministerium, typ,
+    upphavt, text_md. Fel kastas.
+    """
+    r = httpx.get(f"{API_BASE}/regulations/all/current/full",
+                  headers=HEADERS, timeout=httpx.Timeout(30.0, read=300.0))
+    r.raise_for_status()
+    data = r.json()
+    ut = []
+    for item in data if isinstance(data, list) else []:
+        ut.append({
+            "name":        item.get("name", ""),
+            "titill":      item.get("title", ""),
+            "publicerad":  item.get("publishedDate"),
+            "ministerium": ministerium_namn(item.get("ministry")),
+            "typ":         item.get("type"),
+            "upphavt":     str(item.get("repealed")).lower() == "true",
+            "text_md":     html_till_markdown(item.get("text") or ""),
+        })
+    return ut

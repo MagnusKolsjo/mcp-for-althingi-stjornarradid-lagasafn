@@ -461,6 +461,59 @@ def _sq_upsert_dok(kilde, malstegund, beteckning, titill,
         return cur.lastrowid or -1
 
 
+def upsert_reglugerd(
+    beteckning: str,
+    titill: str,
+    dagsetning: Optional[str],
+    url: str,
+    fulltext_md: Optional[str],
+) -> str:
+    """
+    Lägger in eller uppdaterar en förordning i dokument (kilde 'reglugerd')
+    för den semantiska sökningen.
+
+    Ändrad text gör befintliga chunks inaktuella; de tas då bort så att
+    embeddingsteget bygger om dem. Returnerar 'ny', 'andrad' eller
+    'oforandrad'.
+    """
+    p, ph = _prefix(), _ph()
+    with _cursor() as cur:
+        cur.execute(
+            f"SELECT id, fulltext_md, titill FROM {p}dokument "
+            f"WHERE kilde = {ph} AND url = {ph}",
+            ("reglugerd", url),
+        )
+        rad = cur.fetchone()
+        if rad is None:
+            cur.execute(
+                f"INSERT INTO {p}dokument (kilde, malstegund, beteckning, titill, "
+                f"dagsetning, url, fulltext_md) VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})",
+                ("reglugerd", "reglugerd", beteckning, titill, dagsetning or None, url, fulltext_md),
+            )
+            return "ny"
+        dok_id, gammal_text, gammal_titel = rad[0], rad[1], rad[2]
+        if gammal_text == fulltext_md and gammal_titel == titill:
+            return "oforandrad"
+        cur.execute(
+            f"UPDATE {p}dokument SET titill = {ph}, fulltext_md = {ph}, beteckning = {ph} "
+            f"WHERE id = {ph}",
+            (titill, fulltext_md, beteckning, dok_id),
+        )
+        if gammal_text != fulltext_md:
+            cur.execute(f"DELETE FROM {p}chunks WHERE dok_id = {ph}", (dok_id,))
+        return "andrad"
+
+
+def hamta_reglugerd_text(beteckning: str) -> Optional[str]:
+    """Lokalt lagrad text (markdown) för en förordning, eller None."""
+    sql = (f"SELECT fulltext_md FROM {_prefix()}dokument "
+           f"WHERE kilde = {_ph()} AND beteckning = {_ph()} AND fulltext_md IS NOT NULL")
+    with _cursor() as cur:
+        cur.execute(sql, ("reglugerd", beteckning))
+        rad = cur.fetchone()
+    return rad[0] if rad else None
+
+
 # ---------------------------------------------------------------------------
 # Upsert — dokument_rit
 # ---------------------------------------------------------------------------

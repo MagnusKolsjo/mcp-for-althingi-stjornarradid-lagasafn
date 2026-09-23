@@ -39,8 +39,8 @@ sentence-transformer finns idag.
 | `is_hamta_arende` | Hämtar fullständig ärendehistorik — mál + alla þingskjöl |
 | `is_hamta_dokument` | Hämtar metadata för ett enskilt þingskjal |
 | `is_hamta_log` | Hämtar konsoliderad isländsk lag från lagasafn |
-| `is_sok_reglugerd` | Söker i isländska förordningar via api.reglugerd.is |
-| `is_hamta_reglugerd` | Hämtar metadata och PDF-länk för en enskild förordning (konsoliderad PDF när källan har en) |
+| `is_sok_reglugerd` | Fritextsökning i isländska förordningar (källans Elasticsearch över titel och text) |
+| `is_hamta_reglugerd` | Hämtar en förordning med text (markdown) och PDF-länk när källan har en |
 | `is_sok_skyrslur` | FTS-sökning i regeringspublikationer (rit og skýrslur) |
 | `is_hamta_skyrsla` | Hämtar fulltext för en publikation (DB-cache → live PDF) |
 | `is_sok_i_dokument` | Semantisk sökning via pgvector (multilingual-e5-base) |
@@ -92,8 +92,13 @@ synkskript:
 
 - `01_synka_lagasafn.py` — bulk-synk av alla 1 708 gällande lagar via
   althingi.is/lagasafn/zip/. Tar ~5–10 min.
-- `02_synka_reglugerd.py` — bulk-synk av metadata för alla förordningar via
-  api.reglugerd.is. Tar ~2–5 min.
+- `02_synka_reglugerd.py` — hämtar alla förordningar med text i ett anrop
+  (`/regulations/all/current/full`, ~6 200 förordningar, ~57 MB) och lagrar
+  texten för den semantiska sökningen. Förordningar vars text ändrats får sina
+  chunks ombyggda i nästa embeddingsteg. Sökning och hämtning går direkt mot
+  källan och behöver inte den lokala kopian.
+- `04_rensa_reglugerd.py` — nollställer okontrollerade PDF-länkar som äldre
+  synkar lagrade för förordningar. Kör med `--torrkorning` först.
 - `03_chunka_och_embedda.py` — chunkning och embedding för semantisk sökning.
   Krävs bara med PostgreSQL + pgvector.
 
@@ -203,14 +208,22 @@ okänd beteckning, publikation som inte finns, källan svarar inte, databasen
 är nere — ges som MCP-fel (`isError`) med ett meddelande på svenska, inte som
 ett svar med `fel`-nyckel.
 
-`is_hamta_reglugerd`: api.reglugerd.is har för en del förordningar bara
-titel och länkar. Svaret har då `fullstandig: false`, `webb_url` till
-reglugerd.is och en `notering`. `pdf_url` är källans konsoliderade PDF
+`is_hamta_reglugerd`: texten kommer ur källans `text`-fält (HTML omvandlad
+till markdown, med bilagor) och kapas som i övriga hämtverktyg (`max_tecken`,
+`fran_tecken`, `las_vidare`). För en del förordningar har källans detaljsvar
+bara titel och länkar. Svaret har då `fullstandig: false`, `webb_url` till
+reglugerd.is och en `notering`; texten tas i så fall från den lokala kopian
+om den finns (`text_kalla: "lokal_kopia"`). `pdf_url` är källans konsoliderade PDF
 (`pdf_typ: "konsoliderad"`), annars den ursprungliga kungörelsen i
 Stjórnartíðindi (`"originalkungorelse"`), annars `null`.
 
-`is_sok_reglugerd`: källan har fast sidstorlek 30; `max_treff` (1–30) och
-`page` räknas om därefter. En sökning kräver sökterm eller år.
+`is_sok_reglugerd`: källans Elasticsearch-sökning över titel och text med
+isländsk stamning (frågan följer query_string-syntax). Som standard tas
+ändringsförordningar och upphävda förordningar med (`iA`/`iR`);
+`med_andringsforordningar=false` och `med_upphavda=false` ger källans egen
+standard, bara gällande grundförordningar. Källan har fast sidstorlek 30;
+`max_treff` (1–30) och `page` räknas om därefter. En sökning kräver sökterm
+eller år.
 
 ## Svarsstorlek och trunkering
 

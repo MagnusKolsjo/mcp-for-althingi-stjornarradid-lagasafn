@@ -2,33 +2,27 @@
 # Copyright (C) 2026 Magnus Kolsjö
 
 """
-synka_reglugerd.py — Bulk-synk av isländska förordningar från api.reglugerd.is
+02_synka_reglugerd.py — Synk av isländska förordningar för semantisk sökning
 MCP-server för isländsk riksdags- och rättsdata
 
-Laddar ner metadata för alla förordningar via sök-API:t och lagrar i island.dokument.
-PDF-fulltext hämtas inte vid bulk-synk — on-demand via MCP-verktyget is_hamta_reglugerd.
+Verktygen is_sok_reglugerd och is_hamta_reglugerd går direkt mot källan
+(fritextsökning respektive text ur detaljsvaret). Den lokala kopian behövs
+bara för den semantiska sökningen (is_sok_i_dokument): texten lagras i
+island.dokument (kilde 'reglugerd') så att 03_chunka_och_embedda.py kan bygga
+chunks och embeddings av den.
 
 ────────────────────────────────────────────────────────────────────────────────
-API-struktur:
+Källa:
 
-  GET /api/v1/years
-    → lista med år som strängar, t.ex. ['1912', '1916', ..., '2026'] (96 år)
+  GET /api/v1/regulations/all/current/full
+    → alla förordningar (~6 200) med metadata och `text` (HTML) i ett svar,
+      ~57 MB. Ett anrop per synk i stället för ett per förordning.
 
-  GET /api/v1/search?year={ar}&page={sida}
-    → { page, perPage(30), totalPages, totalItems, data: [...] }
-    OBS: tom q ger 0 resultat — sök alltid per år, aldrig med tom fraga.
+Texten görs om till markdown. Har en förordnings text ändrats sedan förra
+synken tas dess chunks bort, så att embeddingsteget bygger om dem. Oförändrade
+förordningar berörs inte.
 
-  Varje post i data:
-    { "name": "1424/2020", "title": "Reglugerð um ...",
-      "publishedDate": "2020-12-30", "ministry": "..." }
-
-  PDF-länk lagras inte här: bara detaljsvaret visar om en PDF finns.
-
-Totalt ~3 000–5 000 förordningar (skattat från stickprov per år).
-Inga robots.txt-restriktioner — API utan crawl-delay.
-OBS: Kör INTE via bash-verktyget — kör i Magnus terminal:
-  python3 synka_reglugerd.py
-Tar ca 2–5 min (nätverks-begränsad, 96 år × paginering).
+Kör:  python3 02_synka_reglugerd.py
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -36,55 +30,17 @@ import logging
 import time
 from pathlib import Path
 
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
+import reglugerd as rg
+
 log = logging.getLogger(__name__)
-
-API_BASE = "https://api.reglugerd.is/api/v1"
-HEADERS  = {
-    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/1.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
-    "Accept":     "application/json",
-}
-PER_PAGE    = 30   # API:ts standardvärde
-SLEEP_AR    = 0.5  # sekunder mellan år (artighetspausi)
-SLEEP_PAGE  = 0.3  # sekunder mellan sidor inom ett år
-
-
-# ---------------------------------------------------------------------------
-# Internfunktioner
-# ---------------------------------------------------------------------------
-
-def _hamta_ar_lista(client: httpx.Client) -> list[str]:
-    """Hämtar alla tillgängliga år från /api/v1/years, sorterade stigande."""
-    r = client.get(f"{API_BASE}/years", headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    ar_lista = r.json()
-    return sorted(ar_lista)  # '1912' → '2026'
-
-
-def _hamta_sida(client: httpx.Client, ar: str, sida: int) -> dict:
-    """
-    Hämtar en sida sökresultat för givet år.
-    Returnerar rå API-dict med page, perPage, totalPages, totalItems, data.
-    """
-    r = client.get(
-        f"{API_BASE}/search",
-        params={"year": ar, "page": sida},
-        headers=HEADERS,
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
 
 
 def _normalisera_beteckning(name: str) -> str:
-    """
-    Normaliserar name-fältet från API ('1424/2020') till 'nr/år'-format.
-    API:t returnerar redan detta format — validering mot heltal.
-    """
+    """'0179/2018' → '179/2018'. Andra format lämnas orörda."""
     try:
         nr, ar = name.split("/")
         return f"{int(nr)}/{int(ar)}"
@@ -92,167 +48,87 @@ def _normalisera_beteckning(name: str) -> str:
         return name
 
 
-# ---------------------------------------------------------------------------
-# Synk
-# ---------------------------------------------------------------------------
-
-def synka_reglugerd() -> dict:
+def synka_reglugerd(max_antal: int | None = None) -> dict:
     """
-    Hämtar metadata för alla isländska förordningar från api.reglugerd.is
-    och lagrar i island.dokument via db.upsert_dokument().
+    Hämtar alla förordningar med text och lagrar dem i island.dokument.
 
-    Strategi:
-      1. Hämta alla tillgängliga år från /api/v1/years.
-      2. För varje år, paginera /api/v1/search?year={ar}.
-      3. Upserta varje förordning (utan PDF-fulltext — on-demand via MCP).
-      4. Uppdatera island.sync_status.
+    Parametrar:
+      max_antal — begränsa antalet förordningar som skrivs, t.ex. vid test.
 
-    Returnerar statistikdict: {totalt, upsertade, tomma_ar, fel}
-
-    OBS: Kör INTE via bash-verktyget — kör i Magnus terminal:
-      python3 synka_reglugerd.py
+    Returnerar statistikdict: {totalt, nya, andrade, oforandrade, utan_text, fel}
     """
     import db as db_mod
 
     db_mod.initiera_schema()
-
-    stats = {
-        "totalt":    0,
-        "upsertade": 0,
-        "tomma_ar":  0,
-        "fel":       [],
-    }
-
+    stats: dict = {"totalt": 0, "nya": 0, "andrade": 0, "oforandrade": 0,
+                   "utan_text": 0, "fel": []}
     start = time.monotonic()
 
-    with httpx.Client(follow_redirects=True) as client:
-
-        # ── Steg 1: Hämta år ────────────────────────────────────────────────
-        try:
-            ar_lista = _hamta_ar_lista(client)
-        except Exception as exc:
-            log.error("Kunde inte hämta år-lista: %s", exc)
-            stats["fel"].append({"ar": "years", "fel": str(exc)})
-            return stats
-
-        log.info("Hittade %d år: %s – %s", len(ar_lista), ar_lista[0], ar_lista[-1])
-
-        # ── Steg 2+3: Paginera per år ────────────────────────────────────────
-        for ar in ar_lista:
-            ar_total  = 0
-            ar_upsert = 0
-            sida      = 1
-
-            while True:
-                try:
-                    svar = _hamta_sida(client, ar, sida)
-                except Exception as exc:
-                    log.warning("Fel vid hämtning av år=%s sida=%d: %s", ar, sida, exc)
-                    stats["fel"].append({"ar": ar, "sida": sida, "fel": str(exc)})
-                    break
-
-                total_sidor = svar.get("totalPages", 0)
-                total_items = svar.get("totalItems", 0)
-                data        = svar.get("data", [])
-
-                if total_items == 0:
-                    # År saknar förordningar (t.ex. luckor i historiken)
-                    stats["tomma_ar"] += 1
-                    break
-
-                for post in data:
-                    stats["totalt"] += 1
-                    ar_total += 1
-
-                    name      = post.get("name", "")
-                    titill    = post.get("title", "")
-                    publicerad = post.get("publishedDate", "")
-                    ministerium = post.get("ministry", "")
-
-                    if not name:
-                        log.debug("Post utan name: %s", post)
-                        continue
-
-                    beteckning = _normalisera_beteckning(name)
-                    url        = f"{API_BASE}/regulation/{name.replace('/', '-').zfill(9)}/current/"
-
-                    # Bygg url på enklare sätt: {nr:04d}-{ar}
-                    try:
-                        nr_del, ar_del = name.split("/")
-                        nr_int = int(nr_del)
-                        url = f"{API_BASE}/regulation/{nr_int:04d}-{ar_del}/current/"
-                    except Exception:
-                        pass
-
-                    try:
-                        db_mod.upsert_dokument(
-                            kilde      = "reglugerd",
-                            malstegund = "reglugerd",
-                            beteckning = beteckning,
-                            titill     = titill,
-                            thing_nr   = None,
-                            skjalnr    = None,
-                            dagsetning = publicerad,
-                            url        = url,
-                            # Sökresultatet säger inte om en konsoliderad
-                            # PDF finns (många förordningar saknar den och
-                            # …/pdf/ ger 404). Länken tas i stället ur
-                            # detaljsvaret av is_hamta_reglugerd.
-                            pdf_url    = None,
-                            fulltext_md = None,  # on-demand via MCP
-                        )
-                        stats["upsertade"] += 1
-                        ar_upsert += 1
-                    except Exception as exc:
-                        log.error("Upsert-fel för %s: %s", name, exc)
-                        stats["fel"].append({"name": name, "fel": str(exc)})
-
-                # Nästa sida?
-                if sida >= total_sidor:
-                    break
-                sida += 1
-                time.sleep(SLEEP_PAGE)
-
-            if ar_upsert > 0:
-                log.debug("  År %s: %d/%d upsertade", ar, ar_upsert, ar_total)
-
-            time.sleep(SLEEP_AR)
-
-        # Mellanlogg var 500:e post
-        if stats["upsertade"] % 500 == 0 and stats["upsertade"] > 0:
-            elapsed = time.monotonic() - start
-            log.info("  %d upsertade (%.0f s)", stats["upsertade"], elapsed)
-
-    # ── Steg 4: sync_status ──────────────────────────────────────────────────
     try:
-        db_mod.set_sync_status(
-            "reglugerd",
-            checksum=str(stats["upsertade"]),
-            detaljer=stats,
-        )
+        poster = rg.hamta_alla_med_text()
+    except Exception as exc:
+        log.error("Bulkhämtningen från api.reglugerd.is misslyckades: %s", exc)
+        stats["fel"].append({"name": None, "fel": str(exc)})
+        return stats
+
+    if max_antal is not None:
+        poster = poster[:max_antal]
+    stats["totalt"] = len(poster)
+    log.info("Hämtade %d förordningar", len(poster))
+
+    for post in poster:
+        name = post["name"]
+        if not name or "/" not in name:
+            continue
+        nr_del, ar_del = name.split("/", 1)
+        try:
+            url = f"{rg.API_BASE}/regulation/{int(nr_del):04d}-{ar_del}/current/"
+        except ValueError:
+            continue
+        if not post["text_md"]:
+            stats["utan_text"] += 1
+        try:
+            utfall = db_mod.upsert_reglugerd(
+                beteckning  = _normalisera_beteckning(name),
+                titill      = post["titill"],
+                dagsetning  = post["publicerad"],
+                url         = url,
+                fulltext_md = post["text_md"] or None,
+            )
+        except Exception as exc:
+            log.error("Upsert-fel för %s: %s", name, exc)
+            stats["fel"].append({"name": name, "fel": str(exc)})
+            continue
+        stats[{"ny": "nya", "andrad": "andrade"}.get(utfall, "oforandrade")] += 1
+
+    try:
+        db_mod.set_sync_status("reglugerd", detaljer={
+            k: (len(v) if isinstance(v, list) else v) for k, v in stats.items()
+        })
     except Exception as exc:
         log.warning("Kunde inte uppdatera sync_status: %s", exc)
 
-    elapsed = time.monotonic() - start
     log.info(
-        "synka_reglugerd klar — upsertade=%d, tomma_ar=%d, fel=%d, tid=%.0f s",
-        stats["upsertade"], stats["tomma_ar"], len(stats["fel"]), elapsed,
+        "synka_reglugerd klar — nya=%d, ändrade=%d, oförändrade=%d, fel=%d, tid=%.0f s",
+        stats["nya"], stats["andrade"], stats["oforandrade"], len(stats["fel"]),
+        time.monotonic() - start,
     )
     return stats
 
 
-# ---------------------------------------------------------------------------
-# Direkt körning — python3 synka_reglugerd.py
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import argparse
+    import sys
 
     # Tolkas innan något körs, så att --help och okända flaggor aldrig
     # startar en synk.
-    argparse.ArgumentParser(
-        description="Bulk-synk av metadata för isländska förordningar från api.reglugerd.is.",
-    ).parse_args()
+    parser = argparse.ArgumentParser(
+        description="Synk av isländska förordningar (med text) från api.reglugerd.is "
+                    "för den semantiska sökningen.",
+    )
+    parser.add_argument("--max-antal", type=int, metavar="N",
+                        help="skriv bara de N första förordningarna, t.ex. vid test")
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -260,15 +136,16 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
 
-    resultat = synka_reglugerd()
+    resultat = synka_reglugerd(max_antal=args.max_antal)
     print(
         f"\nSynk klar:\n"
-        f"  Totalt:     {resultat['totalt']}\n"
-        f"  Upsertade:  {resultat['upsertade']}\n"
-        f"  Tomma år:   {resultat['tomma_ar']}\n"
-        f"  Fel:        {len(resultat['fel'])}"
+        f"  Totalt:       {resultat['totalt']}\n"
+        f"  Nya:          {resultat['nya']}\n"
+        f"  Ändrade:      {resultat['andrade']}\n"
+        f"  Oförändrade:  {resultat['oforandrade']}\n"
+        f"  Utan text:    {resultat['utan_text']}\n"
+        f"  Fel:          {len(resultat['fel'])}"
     )
-    if resultat["fel"]:
-        print("\nFeldetaljer (max 5):")
-        for f in resultat["fel"][:5]:
-            print(f"  {f}")
+    for f in resultat["fel"][:5]:
+        print(f"  {f}")
+    sys.exit(1 if resultat["fel"] or not resultat["totalt"] else 0)

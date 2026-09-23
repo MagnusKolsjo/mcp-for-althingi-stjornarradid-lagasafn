@@ -14,8 +14,8 @@ Exponerar följande verktyg till MCP-kompatibla AI-verktyg:
 
   Lagtext och förordningar:
     is_hamta_log         — Hämtar konsoliderad lagtext från althingi.is/lagasafn/
-    is_hamta_reglugerd   — Hämtar förordningsmetadata från api.reglugerd.is
-    is_sok_reglugerd     — Söker i isländska förordningar via api.reglugerd.is
+    is_hamta_reglugerd   — Hämtar en förordning med text från api.reglugerd.is
+    is_sok_reglugerd     — Fritextsökning i förordningar via api.reglugerd.is
 
   Publikationer:
     is_sok_skyrslur      — Söker i rit og skýrslur via lokal FTS (island.dokument_rit)
@@ -210,6 +210,8 @@ class AlthingiSok(TypedDict):
 class ReglugerdSok(TypedDict):
     fraga: str
     ar: Optional[int]
+    med_andringsforordningar: bool
+    med_upphavda: bool
     page: int
     per_page: int
     total_sidor: int
@@ -561,31 +563,40 @@ def is_hamta_log(
 def is_hamta_reglugerd(
     beteckning: str,
     version: str = "current",
+    max_tecken: int = IS_MAX_TECKEN,
+    fran_tecken: int = 0,
 ) -> dict[str, Any]:
     """
-    Hämtar metadata och PDF-länk för en isländsk förordning (reglugerð)
-    från api.reglugerd.is.
+    Hämtar en isländsk förordning (reglugerð) med text från api.reglugerd.is.
 
-    Täcker förordningar från 1957 till idag.
+    Täcker förordningar från 1957 till idag. Texten kommer ur källans
+    detaljsvar (HTML omvandlad till markdown, med bilagor), inte ur PDF.
 
     Parametrar:
-      beteckning — Förordningens beteckning på formen 'NR/ÅR' (t.ex. '725/2020').
-                   Matchar fältet `name` från is_sok_reglugerd-träffar.
-      version    — 'current' (gällande version med inarbetade ändringar, standard)
-                   eller 'original' (ursprungstext som publicerades).
+      beteckning  — Förordningens beteckning på formen 'NR/ÅR' (t.ex. '725/2020').
+                    Matchar fältet `name` från is_sok_reglugerd-träffar.
+      version     — 'current' (gällande lydelse med inarbetade ändringar,
+                    standard) eller 'original' (ursprungstexten).
+      max_tecken  — Teckentak för texten (standard 60 000). 0 = så mycket som
+                    ryms, högst 200 000 tecken per anrop.
+      fran_tecken — Börja vid denna position, för att läsa vidare efter ett
+                    kapat svar (se fortsatt_fran_tecken och las_vidare).
 
     Returnerar:
       nr, ar, beteckning, version, titill, publicerad, ministerium (namn),
       ikrafttradde_vid, signerades_vid, upphavt, upphavt_vid,
+      text_md (förordningstexten i markdown), text_kalla, tecken_totalt,
+      tecken_visade, trunkerad, fortsatt_fran_tecken, las_vidare,
       pdf_url, pdf_typ, webb_url, fullstandig, url, meta_raw.
 
-    PDF-länken:
-      pdf_typ 'konsoliderad'       — källans PDF med inarbetade ändringar.
-      pdf_typ 'originalkungorelse' — den ursprungliga kungörelsen i
-                                     Stjórnartíðindi (utan senare ändringar).
-      pdf_url null                 — ingen PDF finns via API:t.
-    fullstandig=false betyder att källan bara har titel och länkar för
-    förordningen; `notering` förklarar, och webb_url leder till reglugerd.is.
+    Kortsvar: för en del förordningar har källans detaljsvar bara titel och
+    länkar (fullstandig=false, se `notering`). Finns texten i den lokala
+    synkade kopian används den (text_kalla 'lokal_kopia', med version
+    'current'); annars är text_md null och webb_url leder till reglugerd.is.
+
+    PDF-länken: pdf_typ 'konsoliderad' (källans PDF med inarbetade
+    ändringar), 'originalkungorelse' (den ursprungliga kungörelsen i
+    Stjórnartíðindi) eller pdf_url null.
     Ger ett fel om förordningen inte finns eller beteckningen är ogiltig.
 
     Exempel: is_hamta_reglugerd(beteckning="725/2020")
@@ -601,6 +612,38 @@ def is_hamta_reglugerd(
             f"Förordning {nr}/{ar} (version={version}) hittades inte. "
             "Använd is_sok_reglugerd för att söka efter förordningar."
         )
+
+    text = result.get("text_md")
+    result["text_kalla"] = "api" if text else None
+    if not text and version == "current":
+        try:
+            text = db_mod.hamta_reglugerd_text(f"{nr}/{ar}")
+        except Exception as exc:
+            log.debug("Lokal text för %s/%s gick inte att läsa: %s", nr, ar, exc)
+            text = None
+        if text:
+            result["text_kalla"] = "lokal_kopia"
+            result["notering"] = (
+                "Källans detaljsvar saknar text för denna förordning. text_md "
+                "kommer från den lokala kopian (senaste synk av "
+                "/regulations/all/current/full). Kontrollera gällande lydelse "
+                "på webb_url."
+            )
+
+    if text:
+        _u = _skar_ut(text, max_tecken, fran_tecken)
+        result["text_md"]              = _u["text"]
+        result["tecken_totalt"]        = _u["tecken_totalt"]
+        result["tecken_visade"]        = _u["tecken_visade"]
+        result["trunkerad"]            = _u["trunkerad"]
+        result["fortsatt_fran_tecken"] = _u["fortsatt_fran_tecken"]
+        extra = "" if version == "current" else f', version="{version}"'
+        result["las_vidare"] = _las_vidare(
+            "is_hamta_reglugerd", "beteckning", f"{nr}/{ar}", _u["max_tecken"],
+            _u["fortsatt_fran_tecken"], extra,
+        )
+    else:
+        result["text_md"] = None
     return result
 
 
@@ -610,29 +653,44 @@ def is_sok_reglugerd(
     ar: Optional[int] = None,
     page: int = 1,
     max_treff: int = 20,
+    med_andringsforordningar: bool = True,
+    med_upphavda: bool = True,
 ) -> ReglugerdSok:
     """
     Söker i isländska förordningar (reglugerðir) via api.reglugerd.is.
 
-    Söker i förordningstitlar och innehåll. Täcker 1957–idag.
+    Källans egen fritextsökning (Elasticsearch) över titel och fulltext, med
+    isländsk stamning, så böjda former hittas. Täcker 1957–idag. En
+    beteckning som '179/2018' i frågan matchar förordningen direkt.
 
     Parametrar:
-      fraga     — Sökterm på isländska (t.ex. 'umferðarlag', 'skattur', 'fiskveiðar').
-                  Tom sträng går bara tillsammans med `ar` (alla förordningar
-                  det året); källan ger inga träffar när båda saknas.
+      fraga     — Sökterm på isländska (t.ex. 'umferðarlag', 'vatnsveitu',
+                  'fiskveiðar'). Följer källans query_string-syntax: flera ord
+                  kombineras, "citattecken" ger fras, OR/AND fungerar. Tecken
+                  som : ( ) [ ] { } ^ ~ har specialbetydelse och kan ge 0 träffar.
+                  Tom sträng går bara tillsammans med `ar`.
       ar        — Filtrera på publiceringsår (t.ex. 2020). Alla år om None.
       page      — Sidnummer (1-baserat), räknat i sidor om max_treff poster.
       max_treff — Poster per sida, 1–30 (standard 20).
+      med_andringsforordningar — ta med ändringsförordningar (standard True).
+      med_upphavda — ta med upphävda förordningar (standard True). Sätt båda
+                  till False för att bara söka bland gällande grundförordningar,
+                  vilket är källans egen standard.
 
     Returnerar:
-      fraga, ar, page, per_page, total_sidor, total_antal,
-      data: lista med {name, titill, publicerad, ministerium}.
-    Använd name-fältet (t.ex. '0179/2018') som beteckning till is_hamta_reglugerd.
+      fraga, ar, med_andringsforordningar, med_upphavda, page, per_page,
+      total_sidor, total_antal, data: lista med {name, titill, publicerad,
+      ministerium}. Använd name (t.ex. '0179/2018') som beteckning till
+      is_hamta_reglugerd.
 
     Exempel: is_sok_reglugerd('fiskveiðar', ar=2020)
     """
     try:
-        return rg.sok_reglugerd(fraga=fraga, ar=ar, page=page, per_page=max_treff)
+        return rg.sok_reglugerd(
+            fraga=fraga, ar=ar, page=page, per_page=max_treff,
+            med_andringsforordningar=med_andringsforordningar,
+            med_upphavda=med_upphavda,
+        )
     except ValueError as exc:
         raise ToolError(str(exc))
     except Exception as exc:

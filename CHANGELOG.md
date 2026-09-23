@@ -21,6 +21,12 @@ tillämpar [Semantic Versioning](https://semver.org/).
   inte finns, källan svarar inte, databasen nere) ges som MCP-fel med
   `isError` och ett svenskt meddelande, i stället för ett svar med
   `fel`-nyckel.
+- **Brytande:** publikationer från stjornarradid.is har nya adresser.
+  `url` i `is_sok_skyrslur` och `is_hamta_skyrsla` har formen
+  `/gogn/rit-og-skyrslur/rit/ÅÅÅÅ-MM-DD-slug/` i stället för
+  `/gogn/rit-og-skyrslur/stakt-rit/ÅÅÅÅ/MM/DD/slug/` när `--uppdatera-urler`
+  har körts. Sparade äldre adresser tas fortfarande emot av
+  `is_hamta_skyrsla`.
 - **Brytande:** `is_hamta_reglugerd` — `ministerium` är alltid namnet som
   sträng (tidigare ibland objektet `{slug, name}`). `pdf_url` kan vara `null`.
 - **Brytande:** `is_sok_reglugerd` — sökning utan både sökterm och år avvisas
@@ -36,10 +42,14 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Tillagt
 
-- `stjornarradid_rit.py --uppdatera-urler`: flyttar lagrade publikationer från
-  webbplatsens äldre `/stakt-rit/`-adresser till de nuvarande `/rit/`-adresserna
-  via omdirigeringen och slår ihop dem med poster som redan lagts in under den
-  nya adressen. Idempotent; körs också automatiskt i synken.
+- `stjornarradid_rit.py --uppdatera-urler [--torrkorning]`: flyttar lagrade
+  publikationer från webbplatsens äldre `/stakt-rit/`-adresser till de
+  nuvarande `/rit/`-adresserna via omdirigeringen och slår ihop dem med poster
+  som synken redan lagt in under den nya adressen. Leder omdirigeringen till en
+  mallsida godtas bara en post med samma slug och identisk titel (vid flera
+  sådana även samma år). Nätverksfel och 5xx redovisas som fel. Idempotent;
+  körs uttryckligen, inte av den dagliga synken. `--torrkorning` visar planen
+  utan att skriva.
 - `is_hamta_reglugerd`: fälten `pdf_typ`, `webb_url`, `fullstandig` och, för
   förordningar där källan bara har titel och länkar, `notering`.
 

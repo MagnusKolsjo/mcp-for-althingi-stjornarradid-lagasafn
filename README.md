@@ -113,15 +113,23 @@ alla publikationer med 5 s mellan anropen och tar därför länge.
 
 Publikationer som lagrats med webbplatsens äldre adressform
 (`/gogn/rit-og-skyrslur/stakt-rit/ÅÅÅÅ/MM/DD/slug/`) flyttas till den
-nuvarande (`/gogn/rit-og-skyrslur/rit/ÅÅÅÅ-MM-DD-slug/`) genom att
-webbplatsens omdirigering följs. Poster som synken redan lagt in under den nya
-adressen slås ihop med de gamla, utan att fulltext eller chunks går förlorade.
-Uppdateringen är idempotent och körs automatiskt i varje synk; den kan också
-köras separat:
+nuvarande (`/gogn/rit-og-skyrslur/rit/ÅÅÅÅ-MM-DD-slug/`) i ett separat,
+uttryckligt steg. Webbplatsens omdirigering följs för varje post. Poster som
+synken redan lagt in under den nya adressen slås ihop med de gamla, utan att
+fulltext eller chunks går förlorade. Har webbplatsen gett en publikation nytt
+datum, så att omdirigeringen leder fel, godtas en post med samma slug och
+identisk titel (vid flera sådana krävs samma år). Nätverksfel redovisas som
+fel och leder aldrig till sammanslagning.
+
+Kör först synken, så att listningens poster finns, och sedan:
 
 ```bash
-python3 stjornarradid_rit.py --uppdatera-urler
+python3 stjornarradid_rit.py --uppdatera-urler --torrkorning   # visa planen
+python3 stjornarradid_rit.py --uppdatera-urler                 # genomför
 ```
+
+Uppdateringen är idempotent. Den ingår inte i den dagliga synken; tills den
+körts finns äldre och nya poster för samma publikation sida vid sida.
 
 `is_hamta_skyrsla` tar emot båda adressformerna.
 

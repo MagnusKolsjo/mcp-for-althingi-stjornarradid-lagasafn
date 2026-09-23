@@ -652,61 +652,106 @@ def hamta_rit_fulltext(url: str) -> dict:
 # Äldre URL:er i databasen
 # ---------------------------------------------------------------------------
 
-def uppdatera_aldre_urler(db_mod=None) -> dict:
+def _normalisera_titel(titel: Optional[str]) -> str:
+    return re.sub(r"\s+", " ", (titel or "")).strip().casefold()
+
+
+def _matcha_pa_slug(db_mod, gammal: dict) -> Optional[str]:
+    """
+    Reserv när omdirigeringen leder till en mallsida: webbplatsen har gett en
+    del publikationer nytt datum, medan omdirigeringen behåller det gamla.
+
+    En /rit/-post godtas bara om slug OCH titel är identiska. Återkommande
+    rapporter (årsrapporter o.d.) kan dela slug; har flera poster samma titel
+    krävs dessutom samma år, och annars ingen sammanslagning alls. Året kan
+    inte krävas generellt, eftersom det är just datumet som ändrats.
+    """
+    m = _STAKT_RIT_RE.match(urlparse(gammal["url"]).path)
+    if not m:
+        return None
+    titel = _normalisera_titel(gammal.get("titill"))
+    kandidater = [
+        k for k in db_mod.lista_rit_poster_med_slug(m.group(4))
+        if titel and _normalisera_titel(k["titill"]) == titel
+    ]
+    if len(kandidater) > 1:
+        kandidater = [k for k in kandidater if k["ar"] == gammal.get("ar")]
+    return kandidater[0]["url"] if len(kandidater) == 1 else None
+
+
+def uppdatera_aldre_urler(db_mod=None, torrkorning: bool = False) -> dict:
     """
     Flyttar poster i dokument_rit som har den äldre /stakt-rit/-formen till
-    den kanoniska /rit/-URL:en.
+    den kanoniska /rit/-URL:en. Körs uttryckligen (stjornarradid_rit.py
+    --uppdatera-urler), inte som del av synken.
 
     Omdirigeringen följs per post och målsidan kontrolleras. Leder den till
-    en mallsida används i stället en befintlig /rit/-post med samma slug, om
-    det finns exakt en. Finns redan en
-    post med den nya URL:en (från en synk mot den nya listningen) slås de ihop:
+    en mallsida används en befintlig /rit/-post med samma slug och titel (se
+    _matcha_pa_slug). Finns redan en post med den nya URL:en slås de ihop:
     den nya postens fält behålls och luckor fylls från den gamla, liksom
     chunks om den nya saknar sådana. Den gamla posten tas sedan bort.
+
+    Nätverksfel och 5xx hamnar i `fel`, aldrig i reserven, så att en
+    tillfälligt otillgänglig webbplats inte leder till felaktiga
+    sammanslagningar. Kör synken före uppdateringen, så att listningens
+    poster finns att slå ihop med.
+
+    Med torrkorning=True görs samma kontroller mot webbplatsen, men inget
+    skrivs; `plan` visar vad som skulle ändras.
 
     Idempotent: poster som redan har /rit/-form berörs inte, och utan äldre
     poster görs inga anrop mot webbplatsen. Poster vars publikation inte
     längre finns lämnas orörda och redovisas.
 
-    Returnerar {aldre, flyttade, sammanslagna, hittades_inte, fel}.
+    Returnerar {aldre, flyttade, sammanslagna, hittades_inte, fel, plan}.
     """
     if db_mod is None:
         import db as db_mod
 
     stats: dict = {"aldre": 0, "flyttade": 0, "sammanslagna": 0,
-                   "hittades_inte": [], "fel": []}
+                   "hittades_inte": [], "fel": [], "plan": []}
     aldre = db_mod.lista_rit_urler_med_monster("%/stakt-rit/%")
     stats["aldre"] = len(aldre)
     if not aldre:
         return stats
 
-    log.info("Uppdaterar %d äldre rit-URL:er via webbplatsens omdirigering", len(aldre))
-    for gammal in aldre:
-        ny = folj_omdirigering(gammal)
+    log.info("%s %d äldre rit-URL:er via webbplatsens omdirigering",
+             "Kontrollerar" if torrkorning else "Uppdaterar", len(aldre))
+    for gammal_url in aldre:
+        try:
+            ny = folj_omdirigering(gammal_url)
+        except (Natverksfel, OtillatenUrl) as exc:
+            stats["fel"].append({"url": gammal_url, "fel": str(exc)})
+            continue
+        via = "omdirigering"
         if not ny:
-            # Webbplatsen har bytt datum på en del publikationer, så att
-            # omdirigeringen (som behåller det gamla datumet) leder till en
-            # mallsida. Finns exakt en /rit/-post med samma slug är det samma
-            # publikation.
-            m = _STAKT_RIT_RE.search(gammal)
-            kandidater = db_mod.lista_rit_urler_med_slug(m.group(4)) if m else []
-            if len(kandidater) == 1:
-                ny = kandidater[0]
-                log.info("Omdirigeringen ledde ingenstans; slug matchar %s", ny)
-            else:
-                stats["hittades_inte"].append(gammal)
+            gammal = db_mod.hamta_dokument_rit(gammal_url) or {"url": gammal_url}
+            ny = _matcha_pa_slug(db_mod, gammal)
+            via = "slug och titel"
+            if not ny:
+                stats["hittades_inte"].append(gammal_url)
                 continue
+
+        finns = db_mod.hamta_dokument_rit(ny) is not None
+        utfall = "sammanslagen" if finns else "flyttad"
+        stats["plan"].append({"fran": gammal_url, "till": ny,
+                              "utfall": utfall, "via": via})
+        if torrkorning:
+            stats["flyttade" if utfall == "flyttad" else "sammanslagna"] += 1
+            continue
+
         slug, _ = _slug_och_datum(ny)
         try:
-            utfall = db_mod.flytta_dokument_rit(gammal, ny, slug)
+            utfall = db_mod.flytta_dokument_rit(gammal_url, ny, slug)
         except Exception as exc:
-            log.error("Kunde inte flytta %s → %s: %s", gammal, ny, exc)
-            stats["fel"].append({"url": gammal, "fel": str(exc)})
+            log.error("Kunde inte flytta %s → %s: %s", gammal_url, ny, exc)
+            stats["fel"].append({"url": gammal_url, "fel": str(exc)})
             continue
         stats["flyttade" if utfall == "flyttad" else "sammanslagna"] += 1
-        log.debug("%s: %s → %s", utfall, gammal, ny)
+        log.debug("%s via %s: %s → %s", utfall, via, gammal_url, ny)
 
-    log.info("Äldre URL:er: flyttade=%d, sammanslagna=%d, hittades inte=%d, fel=%d",
+    log.info("Äldre URL:er%s: flyttade=%d, sammanslagna=%d, hittades inte=%d, fel=%d",
+             " (torrkörning)" if torrkorning else "",
              stats["flyttade"], stats["sammanslagna"],
              len(stats["hittades_inte"]), len(stats["fel"]))
     return stats
@@ -772,11 +817,12 @@ def synka_rit(
       1. Hämta hela listningen (alla ?index=-sidor).
       2. Upsert metadata för alla poster. Befintlig fulltext och PDF-länk
          behålls.
-      3. Flytta eventuella poster med äldre /stakt-rit/-URL och slå ihop dem
-         med listningens poster (no-op när inga finns).
-      4. För poster utan fulltext: hämta publikationssidan, ladda ner PDF,
+      3. För poster utan fulltext: hämta publikationssidan, ladda ner PDF,
          extrahera markdown, radera PDF, uppdatera DB.
-      5. Uppdatera island.sync_status.
+      4. Uppdatera island.sync_status.
+
+    Poster med äldre /stakt-rit/-URL flyttas inte här; det görs uttryckligen
+    med --uppdatera-urler (se uppdatera_aldre_urler).
 
     Parametrar:
       hoppa_befintliga_pdf — True (standard): hoppa poster som redan har
@@ -784,7 +830,7 @@ def synka_rit(
       max_pdf — Begränsa PDF-extraktion per körning (None = obegränsat).
 
     Returnerar statistikdict:
-      {hämtade, nya_metadata, pdf_extraherade, pdf_misslyckade, fel, aldre_urler}
+      {hämtade, nya_metadata, pdf_extraherade, pdf_misslyckade, fel}
     """
     import db as db_mod  # Importeras här för att undvika cirkulärt beroende vid test
 
@@ -796,7 +842,6 @@ def synka_rit(
         "pdf_extraherade": 0,
         "pdf_misslyckade": 0,
         "fel":             [],
-        "aldre_urler":     None,
     }
 
     # ── Steg 1: Hämta lista ──────────────────────────────────────────────────
@@ -828,16 +873,7 @@ def synka_rit(
 
     log.info("Metadata upsertad för %d publikationer.", stats["nya_metadata"])
 
-    # ── Steg 3: Äldre URL:er ─────────────────────────────────────────────────
-    try:
-        aldre = uppdatera_aldre_urler(db_mod)
-        stats["aldre_urler"] = {k: (len(v) if isinstance(v, list) else v)
-                                for k, v in aldre.items()}
-    except Exception as exc:
-        log.error("Uppdatering av äldre URL:er misslyckades: %s", exc)
-        stats["fel"].append({"url": None, "fel": f"äldre URL:er: {exc}"})
-
-    # ── Steg 4: PDF-extraktion ───────────────────────────────────────────────
+    # ── Steg 3: PDF-extraktion ───────────────────────────────────────────────
     pdf_count = 0
     for p in poster:
         if max_pdf is not None and pdf_count >= max_pdf:
@@ -870,7 +906,7 @@ def synka_rit(
         else:
             stats["pdf_misslyckade"] += 1
 
-    # ── Steg 5: Uppdatera sync_status ────────────────────────────────────────
+    # ── Steg 4: Uppdatera sync_status ────────────────────────────────────────
     try:
         checksum = hashlib.md5(
             str(sorted(p["url"] for p in poster)).encode()
@@ -907,6 +943,7 @@ if __name__ == "__main__":
     # --max-pdf N          begränsa PDF-extraktionen, t.ex. vid test
     # --lista-bara         lista utan att skriva till databasen
     # --uppdatera-urler    bara flytta poster med äldre /stakt-rit/-URL
+    #   --torrkorning      visa vad som skulle ändras, utan att skriva
     max_pdf: Optional[int] = None
     if "--max-pdf" in sys.argv:
         idx = sys.argv.index("--max-pdf")
@@ -922,18 +959,26 @@ if __name__ == "__main__":
 
     if "--uppdatera-urler" in sys.argv:
         import db as _db
+        torr = "--torrkorning" in sys.argv
         _db.initiera_schema()
-        s = uppdatera_aldre_urler(_db)
+        s = uppdatera_aldre_urler(_db, torrkorning=torr)
+        rubrik = "Äldre URL:er (torrkörning — inget ändrat)" if torr else "Äldre URL:er"
         print(
-            f"\nÄldre URL:er:\n"
+            f"\n{rubrik}:\n"
             f"  Funna:          {s['aldre']}\n"
             f"  Flyttade:       {s['flyttade']}\n"
             f"  Sammanslagna:   {s['sammanslagna']}\n"
             f"  Hittades inte:  {len(s['hittades_inte'])}\n"
             f"  Fel:            {len(s['fel'])}"
         )
-        for u in s["hittades_inte"][:20]:
+        if torr:
+            for p in s["plan"]:
+                print(f"    {p['utfall']:<12} ({p['via']}): {p['fran']}\n"
+                      f"                 → {p['till']}")
+        for u in s["hittades_inte"]:
             print(f"    finns inte längre: {u}")
+        for f in s["fel"]:
+            print(f"    fel: {f['url']}: {f['fel']}")
         sys.exit(1 if s["fel"] else 0)
 
     resultat = synka_rit(hoppa_befintliga_pdf=True, max_pdf=max_pdf)

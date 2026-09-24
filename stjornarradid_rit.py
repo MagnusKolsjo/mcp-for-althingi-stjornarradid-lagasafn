@@ -26,7 +26,7 @@ Steg 2 — PDF-URL per publikation:
   GET https://www.stjornarradid.is/gogn/rit-og-skyrslur/rit/{SEGMENT}/
   → Nedladdningslänken är ett <a> mot /library/?itemid={GUID} (rel="download")
     eller /library?itemid={GUID}&type=pdf. Äldre sidor kan länka direkt till
-    /library/.../fil.pdf. Andra /library-länkar på sidan (favicon, logotyp)
+    en .pdf, under /library/ eller /media/. Andra /library-länkar på sidan (favicon, logotyp)
     är inte <a>-element och räknas inte.
   → Okända sökvägar under /rit/ svarar 200 med en tom mallsida, inte 404.
     En riktig publikationssida känns igen på og:type "article".
@@ -469,6 +469,221 @@ def hamta_rit_lista() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Sitemapen: publikationer som listningen inte visar
+# ---------------------------------------------------------------------------
+
+SITEMAP_URL = BASE_URL + "/sitemap.xml"
+
+# Minsta takt för sitemap-steget när robots.txt inte anger Crawl-delay.
+SITEMAP_MIN_INTERVALL = 2.0
+
+_SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+_robots_las = threading.Lock()
+_robots_crawl_delay: Optional[float] = None
+_robots_last = False
+
+
+def _crawl_delay_ur_robots() -> Optional[float]:
+    """
+    Crawl-delay ur robots.txt (för User-agent: * eller vår egen), eller None.
+    Läses en gång per process.
+    """
+    global _robots_crawl_delay, _robots_last
+    with _robots_las:
+        if _robots_last:
+            return _robots_crawl_delay
+        _robots_last = True
+    r = _hamta(BASE_URL + "/robots.txt", intervall=SITEMAP_MIN_INTERVALL)
+    varde: Optional[float] = None
+    if r is not None:
+        galler = False
+        for rad in r.text.splitlines():
+            rad = rad.split("#", 1)[0].strip()
+            if ":" not in rad:
+                continue
+            nyckel, _, v = rad.partition(":")
+            nyckel, v = nyckel.strip().lower(), v.strip()
+            if nyckel == "user-agent":
+                galler = v == "*" or v.lower().startswith("mcp-for-althingi")
+            elif nyckel == "crawl-delay" and galler:
+                try:
+                    varde = float(v)
+                except ValueError:
+                    pass
+    with _robots_las:
+        _robots_crawl_delay = varde
+    return varde
+
+
+def sitemap_intervall() -> float:
+    """Takten för sitemap-steget: robots.txt:s Crawl-delay, dock minst 2 s."""
+    return max(_crawl_delay_ur_robots() or 0.0, SITEMAP_MIN_INTERVALL)
+
+
+def _xml_locs(innehall: bytes, tagg: str) -> list[tuple[str, Optional[str]]]:
+    """(loc, lastmod) för varje <tagg> i ett sitemap-dokument."""
+    from lxml import etree
+    try:
+        rot = etree.fromstring(innehall)
+    except etree.XMLSyntaxError as exc:
+        log.warning("Sitemap gick inte att tolka: %s", exc)
+        return []
+    ut = []
+    for el in rot.findall(f"sm:{tagg}", _SITEMAP_NS):
+        loc = el.findtext("sm:loc", default="", namespaces=_SITEMAP_NS).strip()
+        lastmod = el.findtext("sm:lastmod", default=None, namespaces=_SITEMAP_NS)
+        if loc:
+            ut.append((loc, lastmod.strip() if lastmod else None))
+    return ut
+
+
+def hamta_sitemap_rit(intervall: Optional[float] = None) -> dict[str, Optional[str]]:
+    """
+    Går igenom sitemapindexet och dess delkartor och returnerar
+    {kanonisk /rit/-URL: lastmod} för alla publikationer.
+
+    Delkartornas adresser kommer från webbplatsen och kontrolleras mot
+    värdlistan innan de hämtas (se _hamta); publikations-URL:er utanför
+    stjornarradid.is eller utanför /gogn/rit-og-skyrslur/rit/ tas inte med.
+    """
+    intervall = intervall or sitemap_intervall()
+    r = _hamta(SITEMAP_URL, intervall=intervall)
+    if r is None:
+        return {}
+    ut: dict[str, Optional[str]] = {}
+    for delkarta, _ in _xml_locs(r.content, "sitemap"):
+        if not ar_tillaten_url(delkarta):
+            log.warning("Hoppar delkarta utanför webbplatsen: %s", delkarta)
+            continue
+        rd = _hamta(delkarta, intervall=intervall)
+        if rd is None:
+            continue
+        for loc, lastmod in _xml_locs(rd.content, "url"):
+            url = kanonisk_rit_url(loc) if ar_tillaten_url(loc) else None
+            if url:
+                ut[url] = lastmod
+    log.info("Sitemapen: %d publikations-URL:er", len(ut))
+    return ut
+
+
+def _las_sitemap_status(db_mod) -> dict[str, str]:
+    """lastmod per URL från förra sitemap-synken (tom vid första körningen)."""
+    try:
+        status = db_mod.get_sync_status("stjornarradid_rit_sitemap")
+    except Exception:
+        return {}
+    detaljer = status.get("detaljer") if status else None
+    if isinstance(detaljer, str):
+        import json
+        try:
+            detaljer = json.loads(detaljer)
+        except ValueError:
+            detaljer = None
+    return dict((detaljer or {}).get("lastmod") or {})
+
+
+def synka_sitemap(db_mod, kanda_urler: set[str], max_antal: Optional[int] = None) -> dict:
+    """
+    Lägger in publikationer som finns i sitemapen men inte i listningen,
+    främst äldre rapporter (1976–2017).
+
+    Inkrementellt via lastmod: en URL behandlas om den saknas i databasen,
+    saknar fulltext och inte redan prövats med samma lastmod, eller om dess
+    lastmod har ändrats sedan förra körningen. Metadata (titel, datum ur URL:en)
+    och PDF-länk tas från publikationssidan i samma anrop.
+
+    Returnerar {i_sitemapen, behandlade, nya, pdf_extraherade, utan_pdf, fel}.
+    """
+    stats: dict = {"i_sitemapen": 0, "behandlade": 0, "nya": 0,
+                   "pdf_extraherade": 0, "utan_pdf": 0, "fel": []}
+    intervall = sitemap_intervall()
+    karta = hamta_sitemap_rit(intervall)
+    stats["i_sitemapen"] = len(karta)
+    if not karta:
+        return stats
+
+    forra = _las_sitemap_status(db_mod)
+    klara = dict(forra)
+    for url, lastmod in sorted(karta.items()):
+        if max_antal is not None and stats["behandlade"] >= max_antal:
+            break
+        if url in kanda_urler and forra.get(url, lastmod) == lastmod:
+            continue
+        andrad = url in forra and forra[url] != lastmod
+        if not andrad and url in forra:
+            continue
+        if not andrad and _har_fulltext(db_mod, url):
+            klara[url] = lastmod
+            continue
+
+        stats["behandlade"] += 1
+        try:
+            sida = _hamta_sida_for_sitemap(url, intervall)
+        except Natverksfel as exc:
+            stats["fel"].append({"url": url, "fel": str(exc)})
+            continue
+        if sida is None:
+            klara[url] = lastmod   # mallsida eller borttagen: pröva igen först vid ny lastmod
+            continue
+
+        slug, dagsetning = _slug_och_datum(url)
+        titill = sida["titill"] or slug.replace("-", " ")
+        try:
+            finns = db_mod.hamta_dokument_rit(url) is not None
+            db_mod.upsert_dokument_rit(
+                url=url, titill=titill, slug=slug, dagsetning=dagsetning,
+                ministerium=None, tema=None,
+                ar=int(dagsetning[:4]) if dagsetning else None,
+                dokumenttyp_isl=extrahera_dokumenttyp(titill),
+                pdf_url=None, fulltext_md=None,
+            )
+            if not finns:
+                stats["nya"] += 1
+        except Exception as exc:
+            stats["fel"].append({"url": url, "fel": str(exc)})
+            continue
+
+        if sida["pdf_kandidater"]:
+            pdf_url, fulltext_md = _extrahera_forsta(sida["pdf_kandidater"])
+            try:
+                _uppdatera_fulltext(db_mod, url, pdf_url, fulltext_md)
+            except Exception as exc:
+                stats["fel"].append({"url": url, "fel": str(exc)})
+                continue
+            if fulltext_md:
+                stats["pdf_extraherade"] += 1
+        else:
+            stats["utan_pdf"] += 1
+        klara[url] = lastmod
+
+    try:
+        db_mod.set_sync_status("stjornarradid_rit_sitemap", detaljer={"lastmod": klara})
+    except Exception as exc:
+        log.warning("Kunde inte spara sitemap-status: %s", exc)
+    log.info("Sitemap-steget: behandlade=%d, nya=%d, pdf=%d, utan pdf=%d, fel=%d",
+             stats["behandlade"], stats["nya"], stats["pdf_extraherade"],
+             stats["utan_pdf"], len(stats["fel"]))
+    return stats
+
+
+def _hamta_sida_for_sitemap(url: str, intervall: float) -> Optional[dict]:
+    """Som hamta_publikationssida men med sitemap-takten och med Natverksfel."""
+    r = _hamta(url, intervall=intervall, kasta_vid_natverksfel=True)
+    if r is None:
+        return None
+    try:
+        tree = lhtml.fromstring(r.content)
+    except Exception:
+        return None
+    if not _ar_publikationssida(tree):
+        return None
+    titel = tree.xpath('//meta[@property="og:title"]/@content')
+    return {"titill": titel[0].strip() if titel else None,
+            "pdf_kandidater": _pdf_kandidater(tree)}
+
+
+# ---------------------------------------------------------------------------
 # Publikationssidan: metadata och PDF-länk
 # ---------------------------------------------------------------------------
 
@@ -486,16 +701,15 @@ def _pdf_kandidater(tree) -> list[str]:
             continue
         href = a.get("href", "").strip()
         lagre = href.lower()
-        if "/library" not in lagre or not ("itemid=" in lagre or lagre.endswith(".pdf")):
+        ar_pdf = lagre.split("?", 1)[0].endswith(".pdf")
+        # /library/?itemid= är nuvarande filarkiv; äldre publikationer länkar
+        # också direkt till .pdf, t.ex. under /media/.
+        if not (ar_pdf or ("/library" in lagre and "itemid=" in lagre)):
             continue
         absolut = urljoin(BASE_URL + "/", href)
         if not ar_tillaten_url(absolut):
             continue
-        tydlig = (
-            a.get("rel", "") == "download"
-            or "type=pdf" in lagre
-            or lagre.endswith(".pdf")
-        )
+        tydlig = a.get("rel", "") == "download" or "type=pdf" in lagre or ar_pdf
         mal = forsta if tydlig else ovriga
         if absolut not in forsta and absolut not in ovriga:
             mal.append(absolut)
@@ -809,6 +1023,8 @@ def _uppdatera_fulltext(
 def synka_rit(
     hoppa_befintliga_pdf: bool = True,
     max_pdf: Optional[int] = None,
+    inkludera_sitemap: bool = False,
+    max_sitemap: Optional[int] = None,
 ) -> dict:
     """
     Synkroniserar rit og skýrslur från stjornarradid.is till lokal DB.
@@ -819,7 +1035,9 @@ def synka_rit(
          behålls.
       3. För poster utan fulltext: hämta publikationssidan, ladda ner PDF,
          extrahera markdown, radera PDF, uppdatera DB.
-      4. Uppdatera island.sync_status.
+      4. Med inkludera_sitemap: lägg in publikationer som bara finns i
+         sitemapen (se synka_sitemap), inkrementellt via lastmod.
+      5. Uppdatera island.sync_status.
 
     Poster med äldre /stakt-rit/-URL flyttas inte här; det görs uttryckligen
     med --uppdatera-urler (se uppdatera_aldre_urler).
@@ -828,9 +1046,12 @@ def synka_rit(
       hoppa_befintliga_pdf — True (standard): hoppa poster som redan har
           fulltext_md i DB. Gör synken inkrementell vid upprepade körningar.
       max_pdf — Begränsa PDF-extraktion per körning (None = obegränsat).
+      inkludera_sitemap — Ta också med sitemapens publikationer (~2 000 fler,
+          främst 1976–2017). Första körningen tar flera timmar.
+      max_sitemap — Begränsa antalet sitemap-publikationer per körning.
 
     Returnerar statistikdict:
-      {hämtade, nya_metadata, pdf_extraherade, pdf_misslyckade, fel}
+      {hämtade, nya_metadata, pdf_extraherade, pdf_misslyckade, fel, sitemap}
     """
     import db as db_mod  # Importeras här för att undvika cirkulärt beroende vid test
 
@@ -906,7 +1127,18 @@ def synka_rit(
         else:
             stats["pdf_misslyckade"] += 1
 
-    # ── Steg 4: Uppdatera sync_status ────────────────────────────────────────
+    # ── Steg 4: Sitemapen (valbar) ────────────────────────────────────────────
+    if inkludera_sitemap:
+        try:
+            sm = synka_sitemap(db_mod, {p["url"] for p in poster}, max_sitemap)
+            stats["sitemap"] = {k: (len(v) if isinstance(v, list) else v)
+                                for k, v in sm.items()}
+            stats["fel"].extend(sm["fel"])
+        except Exception as exc:
+            log.error("Sitemap-steget misslyckades: %s", exc)
+            stats["fel"].append({"url": SITEMAP_URL, "fel": str(exc)})
+
+    # ── Steg 5: Uppdatera sync_status ────────────────────────────────────────
     try:
         checksum = hashlib.md5(
             str(sorted(p["url"] for p in poster)).encode()
@@ -950,6 +1182,11 @@ if __name__ == "__main__":
                         help="med --uppdatera-urler: visa vad som skulle ändras, utan att skriva")
     parser.add_argument("--max-pdf", type=int, metavar="N",
                         help="begränsa PDF-extraktionen till N publikationer, t.ex. vid test")
+    parser.add_argument("--inkludera-sitemap", action="store_true",
+                        help="ta också med publikationer som bara finns i webbplatsens "
+                             "sitemap (främst 1976–2017), inkrementellt via lastmod")
+    parser.add_argument("--max-sitemap", type=int, metavar="N",
+                        help="med --inkludera-sitemap: behandla högst N sitemap-publikationer")
     args = parser.parse_args()
     if args.torrkorning and not args.uppdatera_urler:
         parser.error("--torrkorning kräver --uppdatera-urler")
@@ -992,7 +1229,9 @@ if __name__ == "__main__":
             print(f"    fel: {f['url']}: {f['fel']}")
         sys.exit(1 if s["fel"] else 0)
 
-    resultat = synka_rit(hoppa_befintliga_pdf=True, max_pdf=max_pdf)
+    resultat = synka_rit(hoppa_befintliga_pdf=True, max_pdf=max_pdf,
+                         inkludera_sitemap=args.inkludera_sitemap,
+                         max_sitemap=args.max_sitemap)
     print(
         f"\nSynk klar:\n"
         f"  Hämtade:         {resultat['hämtade']}\n"
@@ -1001,6 +1240,10 @@ if __name__ == "__main__":
         f"  PDF misslyckade: {resultat['pdf_misslyckade']}\n"
         f"  Fel:             {len(resultat['fel'])}"
     )
+    if resultat.get("sitemap"):
+        sm = resultat["sitemap"]
+        print(f"  Sitemap:         {sm['i_sitemapen']} URL:er, behandlade {sm['behandlade']}, "
+              f"nya {sm['nya']}, PDF {sm['pdf_extraherade']}, utan PDF {sm['utan_pdf']}")
     if resultat["fel"]:
         print("\nFeldetaljer:")
         for f in resultat["fel"][:5]:

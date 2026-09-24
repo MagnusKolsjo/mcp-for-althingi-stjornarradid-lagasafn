@@ -13,7 +13,8 @@ Claude och andra MCP-kompatibla AI-assistenter:
   REST-API drivet av Stafrænt Ísland. Täckning 1957 till idag.
 - **Stjórnarráðið rit og skýrslur** — regeringspublikationer (rapporter,
   utredningar, åtgärdsplaner) från `stjornarradid.is`. Webbplatsens listning
-  omfattar omkring 780 publikationer 1991–idag; de indexeras lokalt eftersom
+  omfattar omkring 780 publikationer 1991–idag, och sitemapen ytterligare
+  omkring 2 000 äldre (främst 1976–2017); de indexeras lokalt eftersom
   sajtens egen sökmotor är trasig.
 
 ## Funktion
@@ -113,6 +114,19 @@ Rit-steget (`stjornarradid_rit.py`) går igenom webbplatsens listning
 för poster som saknar fulltext. En tom listning ger exitkod 1, så att en
 ändrad webbplats syns i loggen. Första körningen efter en tom databas hämtar
 alla publikationer med 5 s mellan anropen och tar därför länge.
+
+Med `--inkludera-sitemap` tas också publikationer med som bara finns i
+webbplatsens sitemap (`/sitemap.xml`, omkring 2 700 publikations-URL:er mot
+listningens 780, främst äldre rapporter 1976–2017). För varje sådan hämtas
+publikationssidan (titel, PDF-länk) och PDF:en. Synken är inkrementell via
+sitemapens `lastmod`: en publikation prövas igen bara när dess `lastmod`
+ändrats. Takten är robots.txt:s Crawl-delay, dock minst 2 s. Alla adresser ur
+sitemapen kontrolleras mot värden innan de hämtas. Många äldre poster saknar
+PDF och får då bara titel. `--max-sitemap N` begränsar antalet per körning.
+
+```bash
+python3 stjornarradid_rit.py --inkludera-sitemap --max-sitemap 200
+```
 
 ### Äldre publikations-URL:er
 

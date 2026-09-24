@@ -52,6 +52,14 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Tillagt
 
+- `stjornarradid_rit.py --inkludera-sitemap [--max-sitemap N]`: tar också
+  med publikationer som bara finns i webbplatsens sitemap (omkring 2 000
+  fler, främst 1976–2017), inkrementellt via `lastmod`. Takten följer
+  robots.txt:s Crawl-delay, dock minst 2 s; adresserna ur sitemapen
+  kontrolleras mot värden innan de hämtas.
+- PDF-länkar direkt till `.pdf` utanför `/library/` (t.ex. `/media/`) hittas
+  på publikationssidorna.
+
 - `is_hamta_reglugerd` returnerar förordningens text (`text_md`, markdown ur
   källans `text`-fält med bilagor), kapad med `max_tecken`/`fran_tecken` och
   `las_vidare` som övriga hämtverktyg. Saknar källans detaljsvar text används

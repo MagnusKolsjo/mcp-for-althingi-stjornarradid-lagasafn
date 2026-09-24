@@ -22,7 +22,7 @@ Användning:
   python3 03_chunka_och_embedda.py --kalla dokument      # Bara þingskjöl/lög/regl.
   python3 03_chunka_och_embedda.py --kalla rit           # Bara rit og skýrslur
   python3 03_chunka_och_embedda.py --tvinga              # Återskapa befintliga
-  python3 03_chunka_och_embedda.py --bygg-index          # Bygg IVFFlat-index efteråt
+  python3 03_chunka_och_embedda.py --bygg-index          # Bygg om HNSW-indexen
 """
 
 import argparse
@@ -276,13 +276,14 @@ def _spara_chunks_dok(dok_id: int, chunks: list[dict], embeddings):
     """Sparar chunks i island.chunks (FK: dok_id INTEGER)."""
     import db
     with db._cursor() as cur:
+        typ = db.vektortyp("chunks", cur)
         cur.execute(f"DELETE FROM {db._prefix()}chunks WHERE dok_id = %s", (dok_id,))
         for ch, emb in zip(chunks, embeddings):
             vec_str = "[" + ",".join(str(float(x)) for x in emb) + "]"
             cur.execute(
                 f"""
                 INSERT INTO {db._prefix()}chunks (dok_id, chunk_index, text, embedding)
-                VALUES (%s, %s, %s, %s::vector)
+                VALUES (%s, %s, %s, %s::{typ})
                 ON CONFLICT (dok_id, chunk_index) DO UPDATE SET
                     text      = EXCLUDED.text,
                     embedding = EXCLUDED.embedding
@@ -295,13 +296,14 @@ def _spara_chunks_rit(dok_url: str, chunks: list[dict], embeddings):
     """Sparar chunks i island.chunks_rit (FK: dok_url TEXT)."""
     import db
     with db._cursor() as cur:
+        typ = db.vektortyp("chunks_rit", cur)
         cur.execute(f"DELETE FROM {db._prefix()}chunks_rit WHERE dok_url = %s", (dok_url,))
         for ch, emb in zip(chunks, embeddings):
             vec_str = "[" + ",".join(str(float(x)) for x in emb) + "]"
             cur.execute(
                 f"""
                 INSERT INTO {db._prefix()}chunks_rit (dok_url, chunk_index, text, embedding)
-                VALUES (%s, %s, %s, %s::vector)
+                VALUES (%s, %s, %s, %s::{typ})
                 ON CONFLICT (dok_url, chunk_index) DO UPDATE SET
                     text      = EXCLUDED.text,
                     embedding = EXCLUDED.embedding
@@ -436,54 +438,25 @@ def kor_embedding_rit(tvinga: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# IVFFlat-index
+# Vektorindex
 # ---------------------------------------------------------------------------
 
-def bygg_ivfflat_index(lists: int = 100):
+def bygg_vektorindex(minne: str | None = None) -> None:
     """
-    Bygger IVFFlat-index för ANN-sökning i island.chunks och island.chunks_rit.
+    Bygger om HNSW-indexen för island.chunks och island.chunks_rit (operator-
+    klass efter kolumntyp) och tar bort eventuella dubblettindex.
 
-    Ska köras EFTER att data laddats in. Bygg om när >20 % ny data tillkommer.
-
-    Rekommenderat lists-värde: sqrt(antal_rader).
-      <10k chunks  → 100
-      ~100k chunks → 316
-      ~500k chunks → 707
-
-    För island: ~1 706 lagar × ~5 chunks + ~370 rit × ~10 chunks ≈ 12 000 chunks
-    → lists=100 är lämpligt.
+    Behövs sällan: HNSW tål inskrivningar, så den dagliga synken kräver ingen
+    ombyggnad. Konverteringen till halfvec görs av 05_konvertera_vektorer.py.
     """
     import db
 
-    log.info("Bygger IVFFlat-index (lists=%d)...", lists)
-
-    for schema_tab, index_namn in [
-        (f"{db._prefix()}chunks",     "idx_island_chunks_embedding"),
-        (f"{db._prefix()}chunks_rit", "idx_island_chunks_rit_embedding"),
-    ]:
+    for tabell in db.VEKTORTABELLER:
         with db._cursor() as cur:
-            cur.execute(
-                f"SELECT COUNT(*) FROM {schema_tab} WHERE embedding IS NOT NULL"
-            )
-            antal = cur.fetchone()[0]
-
-        if antal < 10:
-            log.info("Hoppar %s — för få rader (%d) för IVFFlat.", index_namn, antal)
-            continue
-
-        log.info("Bygger %s (%d rader, lists=%d)...", index_namn, antal, lists)
-        with db._cursor() as cur:
-            cur.execute(f"DROP INDEX IF EXISTS {index_namn}")
-            cur.execute(
-                f"""
-                CREATE INDEX {index_namn} ON {schema_tab}
-                    USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = {lists})
-                """
-            )
-        log.info("%s byggt.", index_namn)
-
-    log.info("IVFFlat-index klara.")
+            db.ta_bort_dubblettindex(tabell, cur)
+        log.info("Bygger HNSW-index för island.%s...", tabell)
+        db.bygg_vektorindex(tabell, minne=minne)
+    log.info("HNSW-index klara.")
 
 
 # ---------------------------------------------------------------------------
@@ -517,13 +490,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bygg-index",
         action="store_true",
-        help="Bygg IVFFlat-index för island.chunks och island.chunks_rit efter embedding",
+        help="Bygg om HNSW-indexen för island.chunks och island.chunks_rit",
     )
     parser.add_argument(
-        "--lists",
-        type=int,
-        default=100,
-        help="IVFFlat lists-parameter (standard 100, rekommenderat: sqrt(antal_chunks))",
+        "--minne",
+        default=None,
+        help="maintenance_work_mem för indexbygget, t.ex. 2GB",
     )
     args = parser.parse_args()
 
@@ -548,4 +520,4 @@ if __name__ == "__main__":
     print()
 
     if args.bygg_index:
-        bygg_ivfflat_index(args.lists)
+        bygg_vektorindex(args.minne)

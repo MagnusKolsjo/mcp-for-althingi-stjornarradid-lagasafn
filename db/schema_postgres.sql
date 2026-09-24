@@ -112,8 +112,17 @@ CREATE TABLE IF NOT EXISTS island.chunks (
     CONSTRAINT chunks_dok_chunk_uq UNIQUE (dok_id, chunk_index)
 );
 
-CREATE INDEX IF NOT EXISTS chunks_embedding_idx ON island.chunks
-    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- Indexet byggs bara om det saknas. Kontrollen görs före CREATE INDEX,
+-- eftersom IF NOT EXISTS prövar operatorklassen först och den inte passar
+-- när kolumnen har konverterats till halfvec (se db._migrera_vektorer, som
+-- också byter indexet till HNSW).
+DO $$
+BEGIN
+    IF to_regclass('island.chunks_embedding_idx') IS NULL THEN
+        CREATE INDEX chunks_embedding_idx ON island.chunks
+            USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+    END IF;
+END $$;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -129,8 +138,17 @@ CREATE TABLE IF NOT EXISTS island.chunks_rit (
     CONSTRAINT chunks_rit_dok_chunk_uq UNIQUE (dok_url, chunk_index)
 );
 
-CREATE INDEX IF NOT EXISTS chunks_rit_embedding_idx ON island.chunks_rit
-    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- Indexet byggs bara om det saknas. Kontrollen görs före CREATE INDEX,
+-- eftersom IF NOT EXISTS prövar operatorklassen först och den inte passar
+-- när kolumnen har konverterats till halfvec (se db._migrera_vektorer, som
+-- också byter indexet till HNSW).
+DO $$
+BEGIN
+    IF to_regclass('island.chunks_rit_embedding_idx') IS NULL THEN
+        CREATE INDEX chunks_rit_embedding_idx ON island.chunks_rit
+            USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+    END IF;
+END $$;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────

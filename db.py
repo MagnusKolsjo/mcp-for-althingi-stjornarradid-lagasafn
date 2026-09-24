@@ -127,12 +127,148 @@ def initiera_schema():
             log.info("Schema initierat (%s)", "postgres" if _ar_postgres() else "sqlite")
         finally:
             conn.close()
+        if _ar_postgres():
+            _migrera_vektorer()
     except Exception as exc:
         log.warning(
             "Databasinitiering misslyckades: %s — servern startar utan DB. "
             "Verktygsanrop felar tills databasen är tillgänglig.",
             exc,
         )
+
+
+# ---------------------------------------------------------------------------
+# Vektorlagring: vector eller halfvec
+# ---------------------------------------------------------------------------
+# Embeddings lagras som halfvec(768) (16-bitars flyttal): hälften så stort
+# som vector(768), och träffsäkerheten påverkas inte mätbart för cosinus-
+# sökning. Äldre databaser har vector(768) tills 05_konvertera_vektorer.py
+# körts; frågorna läser därför kolumntypen och castar frågevektorn därefter.
+#
+# Index: HNSW (m=16, ef_construction=64). IVFFlat är mindre och snabbare att
+# bygga, men dess centroider beräknas en gång vid bygget och passar allt
+# sämre när synken lägger till chunks; HNSW tål inskrivningar och ger högre
+# träffsäkerhet per fråga.
+
+VEKTOR_DIM = 768
+HNSW_M = 16
+HNSW_EF_CONSTRUCTION = 64
+HNSW_EF_SEARCH = int(os.getenv("IS_HNSW_EF_SEARCH", "100"))
+# Gäller bara IVFFlat, dvs. en databas som ännu inte konverterats. Varje probe
+# läser ungefär 1/lists av vektorerna; pgvectors standard 1 håller frågan snabb.
+IVFFLAT_PROBES = int(os.getenv("IS_IVFFLAT_PROBES", "1"))
+
+VEKTORTABELLER = ("chunks", "chunks_rit")
+
+# Under den här storleken konverteras en tabell automatiskt vid uppstart (ny
+# eller nästan tom databas). Större tabeller konverteras med
+# 05_konvertera_vektorer.py, eftersom omskrivningen tar tid och disk och
+# servern annars skulle starta långsamt.
+AUTO_KONVERTERA_MAX_RADER = 10_000
+
+
+def vektorindex_namn(tabell: str) -> str:
+    """Namnet på tabellens vektorindex (samma som i bas-schemat)."""
+    return f"{tabell}_embedding_idx"
+
+
+def dubblettindex_namn(tabell: str) -> str:
+    """Ett andra IVFFlat-index som äldre versioner av 03_chunka_och_embedda.py
+    byggde på samma kolumn. Det tas bort; det dubblerar bara lagringen."""
+    return f"idx_island_{tabell}_embedding"
+
+
+def vektortyp(tabell: str, cur=None) -> str:
+    """'halfvec' eller 'vector' för embedding-kolumnen i island.<tabell>."""
+    sql = """SELECT format_type(a.atttypid, a.atttypmod)
+             FROM pg_attribute a
+             WHERE a.attrelid = %s::regclass AND a.attname = 'embedding'"""
+    if cur is not None:
+        cur.execute(sql, (f"island.{tabell}",))
+        rad = cur.fetchone()
+    else:
+        with _cursor() as c:
+            c.execute(sql, (f"island.{tabell}",))
+            rad = c.fetchone()
+    return "halfvec" if rad and rad[0].startswith("halfvec") else "vector"
+
+
+def _sokinstallningar(cur) -> None:
+    """Sökparametrar för vektorindexen; gäller bara transaktionen."""
+    cur.execute(f"SET LOCAL hnsw.ef_search = {HNSW_EF_SEARCH}")
+    cur.execute(f"SET LOCAL ivfflat.probes = {IVFFLAT_PROBES}")
+
+
+def ta_bort_dubblettindex(tabell: str, cur) -> bool:
+    """Tar bort dubblettindexet om det finns. Returnerar True om det fanns."""
+    cur.execute("SELECT 1 FROM pg_indexes WHERE schemaname = 'island' AND indexname = %s",
+                (dubblettindex_namn(tabell),))
+    if cur.fetchone() is None:
+        return False
+    cur.execute(f"DROP INDEX IF EXISTS island.{dubblettindex_namn(tabell)}")
+    return True
+
+
+def bygg_vektorindex(tabell: str, minne: Optional[str] = None,
+                     parallella: Optional[int] = None) -> None:
+    """
+    Bygger om tabellens vektorindex som HNSW med operatorklass efter kolumntyp.
+
+    HNSW-bygget går mycket snabbare när grafen ryms i maintenance_work_mem.
+    Anges minne sätts det för sessionen.
+    """
+    namn = vektorindex_namn(tabell)
+    with _cursor() as cur:
+        ops = "halfvec_cosine_ops" if vektortyp(tabell, cur) == "halfvec" else "vector_cosine_ops"
+        if minne:
+            cur.execute("SET LOCAL maintenance_work_mem = %s", (minne,))
+        if parallella is not None:
+            cur.execute(f"SET LOCAL max_parallel_maintenance_workers = {int(parallella)}")
+        cur.execute(f"DROP INDEX IF EXISTS island.{namn}")
+        cur.execute(
+            f"CREATE INDEX {namn} ON island.{tabell} USING hnsw (embedding {ops}) "
+            f"WITH (m = {HNSW_M}, ef_construction = {HNSW_EF_CONSTRUCTION})"
+        )
+
+
+def konvertera_till_halfvec(tabell: str, cur) -> None:
+    """
+    Byter embedding-kolumnen till halfvec(768). Skriver om hela tabellen.
+
+    Vektorindexen tas bort först: deras operatorklass gäller bara vector.
+    Anroparen bygger nytt index efteråt (bygg_vektorindex).
+    """
+    cur.execute(f"DROP INDEX IF EXISTS island.{vektorindex_namn(tabell)}")
+    ta_bort_dubblettindex(tabell, cur)
+    cur.execute(
+        f"ALTER TABLE island.{tabell} ALTER COLUMN embedding "
+        f"TYPE halfvec({VEKTOR_DIM}) USING embedding::halfvec({VEKTOR_DIM})"
+    )
+
+
+def _migrera_vektorer() -> None:
+    """
+    Vid uppstart: tar bort dubblettindex och konverterar små tabeller till
+    halfvec med HNSW. Stora tabeller lämnas till 05_konvertera_vektorer.py.
+    """
+    konverterade = []
+    with _cursor() as cur:
+        for tabell in VEKTORTABELLER:
+            if ta_bort_dubblettindex(tabell, cur):
+                log.info("Tog bort dubblettindexet island.%s", dubblettindex_namn(tabell))
+            if vektortyp(tabell, cur) == "halfvec":
+                continue
+            cur.execute(f"SELECT count(*) FROM (SELECT 1 FROM island.{tabell} "
+                        f"LIMIT {AUTO_KONVERTERA_MAX_RADER + 1}) x")
+            if cur.fetchone()[0] > AUTO_KONVERTERA_MAX_RADER:
+                log.info("island.%s lagrar embeddings som vector. Kör "
+                         "05_konvertera_vektorer.py för att byta till halfvec och HNSW.", tabell)
+                continue
+            konvertera_till_halfvec(tabell, cur)
+            konverterade.append(tabell)
+    for tabell in konverterade:
+        bygg_vektorindex(tabell)
+        log.info("island.%s konverterad till halfvec(%d) med HNSW-index", tabell, VEKTOR_DIM)
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +882,8 @@ def vektor_sok(
     if not _ar_postgres():
         log.warning("vektor_sok: pgvector kräver PostgreSQL.")
         return []
+    if tabell not in VEKTORTABELLER:
+        raise ValueError(f"Okänd vektortabell: {tabell}")
 
     vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
     schema_tab = f"island.{tabell}"
@@ -759,19 +897,20 @@ def vektor_sok(
 
     sql = f"""
         SELECT c.chunk_index, c.text,
-               1 - (c.embedding <=> %s::vector) AS likhet,
+               1 - (c.embedding <=> %s::{{typ}}) AS likhet,
                {select_extra}
         FROM   {schema_tab} c
         {join_sql}
         WHERE  c.embedding IS NOT NULL
-        ORDER  BY c.embedding <=> %s::vector
+        ORDER  BY c.embedding <=> %s::{{typ}}
         LIMIT  %s
     """
 
     # Databasfel kastas vidare: en tom lista skulle se ut som "inga träffar"
     # när Postgres i själva verket är nere.
     with _cursor() as cur:
-        cur.execute(sql, [vec_str, vec_str, max_treff])
+        _sokinstallningar(cur)
+        cur.execute(sql.format(typ=vektortyp(tabell, cur)), [vec_str, vec_str, max_treff])
         rader = cur.fetchall()
         kolumner = [c[0] for c in (cur.description or [])]
 

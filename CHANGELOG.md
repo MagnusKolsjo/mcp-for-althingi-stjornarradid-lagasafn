@@ -11,6 +11,23 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Ändrat
 
+- Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
+  ef_construction=64) i stället för `vector(768)` med IVFFlat. Frågorna läser
+  kolumntypen och fungerar före och efter konverteringen; `hnsw.ef_search`
+  (`IS_HNSW_EF_SEARCH`, standard 100) och `ivfflat.probes`
+  (`IS_IVFFLAT_PROBES`, standard 1) sätts per fråga. Tabeller med högst
+  10 000 chunks konverteras vid uppstart; större med
+  `05_konvertera_vektorer.py`. I en kopia av en befintlig databas (100 000
+  chunks) krympte chunk-tabellerna från 1,2 GB till 0,45 GB, och
+  indexsökningens topp-10 stämde med exakt sökning i 153 av 160 fall mot
+  51 av 160 med IVFFlat.
+- Uppstarten tar bort det dubblerade IVFFlat-indexet
+  (`idx_island_chunks_embedding`, `idx_island_chunks_rit_embedding`) som
+  äldre `03_chunka_och_embedda.py --bygg-index` byggde vid sidan av
+  schemats index.
+- `03_chunka_och_embedda.py --bygg-index` bygger om HNSW-indexen; `--lists`
+  ersatt av `--minne`.
+
 - **Brytande:** kräver `mcp` 2.x (`mcp>=2.0,<3`). Servern bygger på
   `MCPServer`; transporten startas via `mcp_transport.py`.
 - **Brytande:** http-läget kräver `MCP_API_KEY`. Utan nyckel avbryts
@@ -70,6 +87,9 @@ tillämpar [Semantic Versioning](https://semver.org/).
 - Förordningar ingår i den semantiska sökningen: `02_synka_reglugerd.py`
   hämtar alla förordningar med text i ett anrop och lagrar texten; ändrad
   text gör att chunks byggs om.
+- `05_konvertera_vektorer.py [--torrkorning] [--tabell …] [--bara-index]`:
+  byter embeddings till `halfvec(768)`, bygger HNSW-index och tar bort
+  dubblettindex. `--torrkorning` visar läge, plan och uppskattad storlek.
 - `04_rensa_reglugerd.py [--torrkorning]`: nollställer okontrollerade
   PDF-länkar som äldre synkar lagrade för förordningar.
 

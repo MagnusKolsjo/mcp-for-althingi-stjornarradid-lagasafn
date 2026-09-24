@@ -175,6 +175,45 @@ installation. Båda valen är symmetriska, inget är "fallback".
   exitkod 2. Klienten skickar `Authorization: Bearer <nyckel>`; saknad header
   ger 401 och fel nyckel 403.
 
+### Vektorlagring (PostgreSQL)
+
+Embeddings (`island.chunks`, `island.chunks_rit`) lagras som `halfvec(768)`
+med HNSW-index (`halfvec_cosine_ops`, m=16, ef_construction=64). Det är
+hälften så stort som `vector(768)` och ger samma topp-10 som exakt sökning
+i provmätningen; `IS_HNSW_EF_SEARCH` (standard 100) sätts per fråga.
+
+Servern läser kolumntypen vid varje sökning och fungerar både före och efter
+konverteringen. En ny eller nästan tom databas (högst 10 000 chunks per
+tabell) konverteras automatiskt vid uppstart. En större databas konverteras
+i ett uttryckligt steg, eftersom tabellen skrivs om och är låst under tiden.
+Uppstarten tar också bort ett dubblettindex som äldre versioner av
+`03_chunka_och_embedda.py` byggde på samma kolumn.
+
+## Uppgradering av en befintlig installation (från 1.1.0)
+
+Ordningen spelar roll; stegen 3–6 ändrar databasen.
+
+1. Installera den nya koden och `requirements.txt` (mcp 2.x) och starta
+   servern en gång. Uppstarten tar bort dubblettindexen på `island.chunks`
+   och `island.chunks_rit`; lagrar tabellerna embeddings som `vector` loggas
+   att `05_konvertera_vektorer.py` behövs. Servern fungerar ändå.
+2. Kör rit-synken: `python3 stjornarradid_rit.py` (den nya listningen).
+3. Flytta publikationer med äldre adresser:
+   `python3 stjornarradid_rit.py --uppdatera-urler --torrkorning`, därefter
+   utan `--torrkorning`.
+4. Byt vektorlagringen till `halfvec` med HNSW:
+   `python3 05_konvertera_vektorer.py --torrkorning`, därefter
+   `python3 05_konvertera_vektorer.py`. Tabellerna är låsta under
+   omskrivningen; semantiska sökningar väntar tills den är klar.
+5. Hämta förordningarna med text: `python3 02_synka_reglugerd.py`, och
+   rensa gamla PDF-länkar: `python3 04_rensa_reglugerd.py --torrkorning`,
+   därefter utan flaggan.
+6. Chunka och embedda det som saknas: `python3 03_chunka_och_embedda.py`.
+   Förordningarna ger tiotusentals nya chunks, som lagras som `halfvec`.
+7. Valfritt: äldre rapporter via sitemapen,
+   `python3 stjornarradid_rit.py --inkludera-sitemap`, i omgångar med
+   `--max-sitemap N`.
+
 ## Känd begränsning — Alþingi-verktygen returnerar HTTP 403
 
 Sedan 2026-05-18 returnerar Alþingis Cloudflare-shield `HTTP 403` med flaggan

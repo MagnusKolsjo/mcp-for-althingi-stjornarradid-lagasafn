@@ -69,6 +69,13 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Tillagt
 
+- `pdftext_skydd.py`: minnes- och tidsvakt kring PDF-extraktionen i
+  `stjornarradid_rit.py`. Extraktionen körs i en egen process, i sidblock
+  (`IS_PDF_SIDBLOCK`), och avbryts vid `IS_PDF_MAX_MINNE_MB` eller
+  `IS_PDF_TIDSGRANS_S` — ett enskilt bildtungt dokument kan då inte längre
+  fälla processen. Block som avbryts läses om med ren textutvinning, och
+  dokument som fick minst en sida OCR:ad eller föll tillbaka på ren
+  textutvinning läggs i en OCR-kö (`IS_OCR_KO_MAPP`) för senare, bättre OCR.
 - `stjornarradid_rit.py --inkludera-sitemap [--max-sitemap N]`: tar också
   med publikationer som bara finns i webbplatsens sitemap (omkring 2 000
   fler, främst 1976–2017), inkrementellt via `lastmod`. Takten följer
@@ -106,6 +113,10 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Rättat
 
+- PDF-extraktionen i `stjornarradid_rit.py` OCR:ade sidor utan textlager med
+  standardspråket engelska, eftersom `ocr_language` aldrig sattes. Isländska
+  tecken blev därmed fel. OCR-språket är nu uttryckligen `isl+eng`
+  (`IS_OCR_SPRAK`).
 - Stjórnarráðið-skrapningen fungerar mot den ombyggda webbplatsen: ny
   listning med paginering (`?index=N`, omkring 780 publikationer 1991–idag),
   nya publikationsadresser och PDF-länkar under `/library/?itemid=`.

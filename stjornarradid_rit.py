@@ -6,7 +6,8 @@ stjornarradid_rit.py — Klient och synkmodul för stjornarradid.is rit og skýr
 MCP-server för isländsk riksdags- och rättsdata
 
 Listar regeringens publikationer på stjornarradid.is, extraherar PDF-fulltext
-med pymupdf4llm och lagrar allt i island.dokument_rit.
+under minnes- och tidsvakt (pdftext_skydd, rätt OCR-språk isl+eng) och lagrar
+allt i island.dokument_rit.
 
 ────────────────────────────────────────────────────────────────────────────────
 Datakällor
@@ -33,8 +34,8 @@ Steg 2 — PDF-URL per publikation:
 
 Steg 3 — PDF-extraktion:
   GET {pdf_url}  → application/pdf
-  → pymupdf4llm.to_markdown(tmp_fil) → fulltext_md
-  → tmp_fil raderas direkt efter extraktion (ingen persistent PDF-cache).
+  → pdftext_skydd.extrahera_pdf(pdf_bytes, prefix="IS", standardsprak="isl+eng")
+    → fulltext_md, under minnes- och tidsvakt i en egen process (se pdftext_skydd.py).
 
 URL-former:
   Äldre webbplatsen:  /gogn/rit-og-skyrslur/stakt-rit/YYYY/MM/DD/SLUG/
@@ -55,7 +56,6 @@ Sajtens sökmotor är trasig — all sökning sker mot lokal DB (island.dokument
 import hashlib
 import logging
 import re
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -65,6 +65,8 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from dotenv import load_dotenv
 from lxml import html as lhtml
+
+from pdftext_skydd import extrahera_pdf
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -769,33 +771,16 @@ def _hamta_pdf(pdf_url: str) -> Optional[bytes]:
 
 
 def _extrahera_markdown(pdf_bytes: bytes, kalla: str) -> Optional[str]:
-    """Extraherar markdown ur PDF-bytes via en temporär fil som alltid raderas."""
+    """Extraherar markdown ur PDF-bytes under minnes- och tidsvakt (pdftext_skydd)."""
     try:
-        import pymupdf4llm   # type: ignore
-    except ImportError:
-        log.error("pymupdf4llm saknas. Installera: pip install pymupdf4llm")
-        return None
-
-    tmp_path: Optional[Path] = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".pdf", delete=False, prefix="island_rit_"
-        ) as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = Path(tmp.name)
-        fulltext_md: str = pymupdf4llm.to_markdown(str(tmp_path))
-        log.debug("PDF extraherad: %s → %d tecken", kalla, len(fulltext_md))
-        return fulltext_md or None
+        res = extrahera_pdf(pdf_bytes, prefix="IS", standardsprak="isl+eng",
+                            kalla_id=kalla, kalla_url=kalla)
+        log.debug("PDF extraherad: %s → %d tecken (metod=%s)",
+                  kalla, len(res.text), res.metod)
+        return res.text or None
     except Exception as exc:
-        log.error("pymupdf4llm-fel för %s: %s", kalla, exc)
+        log.error("PDF-extraktionsfel för %s: %s", kalla, exc)
         return None
-    finally:
-        # PDF raderas alltid — ingen persistent lokal kopia
-        if tmp_path and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception as exc:
-                log.warning("Kunde inte radera tmp-PDF %s: %s", tmp_path, exc)
 
 
 def extrahera_pdf_fulltext(pdf_url: str) -> Optional[str]:

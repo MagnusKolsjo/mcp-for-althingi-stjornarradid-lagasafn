@@ -825,7 +825,8 @@ def is_hamta_skyrsla(
 
     Slår först upp i lokal DB-cache (island.dokument_rit). Om fulltext saknas
     — t.ex. för ny publikation eller misslyckad synk — hämtas PDF live från
-    stjornarradid.is, extraheras med pymupdf4llm och returneras.
+    stjornarradid.is, extraheras under minnes- och tidsvakt (pdftext_skydd)
+    och returneras.
 
     Parametrar:
       url         — URL till publikationen på stjornarradid.is, helst från

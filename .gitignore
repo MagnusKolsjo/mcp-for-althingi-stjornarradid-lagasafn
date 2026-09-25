@@ -17,6 +17,9 @@ __pycache__/
 # Loggar (genereras av synk_daglig.sh)
 logs/
 
+# OCR-kö (pdftext_skydd.py) — köade PDF:er och deras metadata
+ocr_ko/
+
 # Miljövariabler — ska aldrig checkas in
 .env
 

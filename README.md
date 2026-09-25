@@ -128,6 +128,23 @@ PDF och får då bara titel. `--max-sitemap N` begränsar antalet per körning.
 python3 stjornarradid_rit.py --inkludera-sitemap --max-sitemap 200
 ```
 
+### PDF-extraktion — OCR-språk, minnesvakt och OCR-kö
+
+PDF-extraktionen för rit og skýrslur går genom `pdftext_skydd.py`
+(`extrahera_pdf`, prefix `IS`). Den kör extraktionen i en egen process, i
+block om `IS_PDF_SIDBLOCK` sidor (standard 20), och avbryter blocket om det
+passerar `IS_PDF_MAX_MINNE_MB` (standard 3000 MB) eller `IS_PDF_TIDSGRANS_S`
+(standard 300 s) — ett enskilt bildtungt dokument kan då aldrig fälla
+processen. OCR-språket är `isl+eng` som standard (`IS_OCR_SPRAK`), så sidor
+utan textlager läses med isländska tecken i stället för engelska.
+
+Ett block som passerar gränserna läses i stället med ren textutvinning (utan
+layout och OCR). Dokument som fick minst en sida OCR:ad, eller där något
+block föll tillbaka på ren textutvinning, läggs i OCR-kön
+(`IS_OCR_KO_MAPP`, standard `ocr_ko/ko.jsonl` + `ocr_ko/filer/`) tillsammans
+med PDF:en, så att de kan köras genom en bättre OCR senare utan att laddas
+ned igen.
+
 ### Äldre publikations-URL:er
 
 Publikationer som lagrats med webbplatsens äldre adressform

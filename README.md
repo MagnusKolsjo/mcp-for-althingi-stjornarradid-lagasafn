@@ -231,45 +231,32 @@ Ordningen spelar roll; stegen 3–6 ändrar databasen.
    `python3 stjornarradid_rit.py --inkludera-sitemap`, i omgångar med
    `--max-sitemap N`.
 
-## Känd begränsning — Alþingi-verktygen returnerar HTTP 403
+## Åtkomst till althingi.is
 
-Sedan 2026-05-18 returnerar Alþingis Cloudflare-shield `HTTP 403` med flaggan
-`cf-mitigated: challenge` för alla anrop till `althingi.is`-domänen, oavsett
-User-Agent. Det påverkar fem av tio MCP-verktyg:
+Mellan 2026-05-18 och september 2026 svarade Alþingis Cloudflare-skydd med
+`HTTP 403` (`cf-mitigated: challenge`) på alla automatiserade anrop till
+`althingi.is`, och fem av de tio verktygen (`is_lista_thing`,
+`is_sok_althingi`, `is_hamta_arende`, `is_hamta_dokument` och `is_hamta_log`
+för icke-cachade lagar) fungerade inte.
 
-- `is_lista_thing`
-- `is_sok_althingi`
-- `is_hamta_arende`
-- `is_hamta_dokument`
-- `is_hamta_log` (för icke-cachade lagar)
+Blockeringen är hävd. Sedan 2026-09-24 svarar `althingi.is` med vanliga anrop
+och projektets egen User-Agent, och alla tio verktygen fungerar utan särskild
+konfiguration. Domänen ligger fortfarande bakom Cloudflare, så skyddet kan
+skärpas igen. Då svarar de berörda verktygen med ett fel som säger att
+källan blockerar automatiserade anrop, och de övriga verktygen
+(`is_sok_reglugerd`, `is_hamta_reglugerd`, `is_sok_skyrslur`,
+`is_hamta_skyrsla`, `is_sok_i_dokument`) fungerar som vanligt eftersom de inte
+hämtar från `althingi.is`.
 
-De övriga fem verktygen (`is_sok_reglugerd`, `is_hamta_reglugerd`,
-`is_sok_skyrslur`, `is_hamta_skyrsla`, `is_sok_i_dokument`) fungerar normalt
-— blockeringen är specifik för `althingi.is`.
-
-### Vad som har testats utan framgång
-
-- `curl_cffi` med Chrome-, Safari- och Edge-TLS-fingerprints (alla varianter
-  ger 403).
-- Manuellt hämtad `cf_clearance`-cookie från Safari (avvisas när den
-  återanvänds från en serverside-klient).
-- `Mozilla/5.0 (compatible; ...)`-prefixade User-Agent-strängar.
-
-Cloudflare-challengen kräver troligen client-side JavaScript-rendering, vilket
-inte kan reproduceras från ett serverside-klientbibliotek.
-
-### Tillfällig genväg
-
-Om du har en `cf_clearance`-cookie från Safari kan du sätta:
+Anropen till `althingi.is` görs med `curl_cffi`. Två valfria inställningar i
+`.env` finns kvar för en installation som behöver dem:
 
 ```bash
-ALTHINGI_CF_CLEARANCE=<värdet från Safari>
-ALTHINGI_USER_AGENT=<Safaris exakta User-Agent>
+ALTHINGI_USER_AGENT=<egen User-Agent>
+ALTHINGI_CF_CLEARANCE=<cf_clearance-cookie från en webbläsarsession>
 ```
 
-i `.env`. Klienten väljer då Safari-fingerprint automatiskt. Lyckas inte
-universellt — fungerar i vissa konfigurationer.
-
+Ingen av dem behövs i dag.
 
 ## Fel och svarsformat
 

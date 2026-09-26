@@ -9,6 +9,9 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Dokumentation
+- README och `config.example.env` beskriver att althingi.is åter svarar på automatiserade anrop sedan 2026-09-24 och att alla tio verktygen fungerar. Avsnittet om den tidigare blockeringen (2026-05-18 och framåt) är omskrivet; `ALTHINGI_USER_AGENT` och `ALTHINGI_CF_CLEARANCE` finns kvar som valfria inställningar.
+
 ### Ändrat
 
 - Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,

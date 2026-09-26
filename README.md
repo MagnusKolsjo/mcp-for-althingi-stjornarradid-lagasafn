@@ -1,7 +1,7 @@
 # mcp-for-althingi-stjornarradid-lagasafn
 
 MCP-server för isländsk riksdags- och rättsdata. Exponerar fyra källor till
-Claude och andra MCP-kompatibla AI-assistenter:
+MCP-kompatibla AI-assistenter:
 
 - **Alþingi** — riksdagsdokument, ärendehistorik och voteringar via det
   officiella XML-API:et (`althingi.is/altext/xml/`). Täckning från det första
@@ -72,8 +72,7 @@ sentence-transformer finns idag.
    Sätt minst `DATABASE_URL` (PostgreSQL eller SQLite). Andra variabler är
    valfria — se kommentarer i `config.example.env`.
 
-4. Lägg till servern i Claude Desktops konfiguration
-   (`~/Library/Application Support/Claude/claude_desktop_config.json` på macOS):
+4. Lägg till servern i MCP-klientens konfiguration (`mcpServers`):
 
    ```json
    "island": {
@@ -83,7 +82,7 @@ sentence-transformer finns idag.
    }
    ```
 
-5. Starta om Claude Desktop. De tio MCP-verktygen blir tillgängliga.
+5. Starta om MCP-klienten. De tio MCP-verktygen blir tillgängliga.
 
 ## Datakällor och täckning
 

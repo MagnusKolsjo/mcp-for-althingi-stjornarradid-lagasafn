@@ -16,6 +16,7 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Ändrat
 
+- Texterna är produktneutrala: README, konfigurationsexempel, kommentarer och äldre CHANGELOG-poster nämner MCP-klienten i stället för en viss klient.
 - User-Agent-strängen följer huvudversionen: `mcp-for-althingi-stjornarradid-lagasafn/2.0`.
 - Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
   ef_construction=64) i stället för `vector(768)` med IVFFlat. Frågorna läser

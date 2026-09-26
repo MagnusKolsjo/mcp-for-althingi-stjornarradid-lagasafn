@@ -22,7 +22,9 @@ HTML-struktur (gammal men konsistent):
   - Fotnoter:          <i>L. 56/1991, 1. gr.</i> (lagändringsreferenser)
   - Dekorbilder:       <img src="/lagas/sk.jpg"> (ignoreras)
 
-Robots.txt: ClaudeBot: Disallow: / och ai-train=no.
+Robots.txt (kontrollerad 2026-09-26): Crawl-delay 5 s för alla; /lagas/ är inte
+spärrad. Källan hänvisar automatiserad insamling till XML-tjänsten
+(https://www.althingi.is/altext/xml/).
 Crawl-delay: 5 sekunder (tillämpas via token-bucket i althingi.py — återanvänds här).
 User-Agent: mcp-for-althingi-stjornarradid-lagasafn/2.0 (krävs — 403 utan).
 """

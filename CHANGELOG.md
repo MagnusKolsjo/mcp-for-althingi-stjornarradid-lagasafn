@@ -16,6 +16,7 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Ändrat
 
+- Frågeexpansion på serversidan har inget förvalt modellnamn. `QUERY_EXPANSION_MODEL` anges alltid i `.env` (platshållare `<modellnamn>` i `config.example.env`); saknas det hoppas expansionen över.
 - Texterna är produktneutrala: README, konfigurationsexempel, kommentarer och äldre CHANGELOG-poster nämner MCP-klienten i stället för en viss klient.
 - User-Agent-strängen följer huvudversionen: `mcp-for-althingi-stjornarradid-lagasafn/2.0`.
 - Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,

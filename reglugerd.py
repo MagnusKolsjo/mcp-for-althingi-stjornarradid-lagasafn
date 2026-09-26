@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://api.reglugerd.is/api/v1"
 HEADERS  = {
-    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/1.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
+    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/2.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
     "Accept":     "application/json",
 }
 

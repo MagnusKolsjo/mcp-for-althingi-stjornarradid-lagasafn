@@ -24,7 +24,7 @@ HTML-struktur (gammal men konsistent):
 
 Robots.txt: ClaudeBot: Disallow: / och ai-train=no.
 Crawl-delay: 5 sekunder (tillämpas via token-bucket i althingi.py — återanvänds här).
-User-Agent: mcp-for-althingi-stjornarradid-lagasafn/1.0 (krävs — 403 utan).
+User-Agent: mcp-for-althingi-stjornarradid-lagasafn/2.0 (krävs — 403 utan).
 """
 
 import logging
@@ -56,7 +56,7 @@ ALTHINGI_CF_CLEARANCE = os.getenv("ALTHINGI_CF_CLEARANCE", "")
 # annars avvisar Cloudflare cookien. Tom faller tillbaka till projektets egen UA.
 ALTHINGI_USER_AGENT = os.getenv(
     "ALTHINGI_USER_AGENT",
-    "mcp-for-althingi-stjornarradid-lagasafn/1.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
+    "mcp-for-althingi-stjornarradid-lagasafn/2.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
 )
 
 HEADERS = {

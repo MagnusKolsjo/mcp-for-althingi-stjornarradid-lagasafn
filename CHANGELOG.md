@@ -9,11 +9,14 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-09-26
+
 ### Dokumentation
 - README och `config.example.env` beskriver att althingi.is åter svarar på automatiserade anrop sedan 2026-09-24 och att alla tio verktygen fungerar. Avsnittet om den tidigare blockeringen (2026-05-18 och framåt) är omskrivet; `ALTHINGI_USER_AGENT` och `ALTHINGI_CF_CLEARANCE` finns kvar som valfria inställningar.
 
 ### Ändrat
 
+- User-Agent-strängen följer huvudversionen: `mcp-for-althingi-stjornarradid-lagasafn/2.0`.
 - Embeddings lagras som `halfvec(768)` med HNSW-index (m=16,
   ef_construction=64) i stället för `vector(768)` med IVFFlat. Frågorna läser
   kolumntypen och fungerar före och efter konverteringen; `hnsw.ef_search`

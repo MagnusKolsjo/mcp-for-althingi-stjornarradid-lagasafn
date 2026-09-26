@@ -82,7 +82,7 @@ LISTA_URL   = BASE_URL + "/gogn/rit-og-skyrslur/"
 RIT_PREFIX  = BASE_URL + "/gogn/rit-og-skyrslur/rit/"
 CRAWL_DELAY = 5.0
 HEADERS     = {
-    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/1.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
+    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/2.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
     "Accept":     "text/html,application/xhtml+xml,*/*",
 }
 

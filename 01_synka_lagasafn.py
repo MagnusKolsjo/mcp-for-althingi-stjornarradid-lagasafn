@@ -28,7 +28,7 @@ kan hämtas genom att byta version-parametern — se hamta_log_lista_versioner()
 i lagasafn.py. Bulk-synk körs med 'nuna' och ersätter befintliga poster.
 
 robots.txt: Crawl-delay: 5 — tillämpas INTE på bulk-ZIP (en enda fil).
-User-Agent: mcp-for-althingi-stjornarradid-lagasafn/1.0 krävs.
+User-Agent: mcp-for-althingi-stjornarradid-lagasafn/2.0 krävs.
 ────────────────────────────────────────────────────────────────────────────────
 """
 
@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 
 ZIP_URL  = "https://www.althingi.is/lagasafn/zip/{version}/allt.zip"
 HEADERS  = {
-    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/1.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
+    "User-Agent": "mcp-for-althingi-stjornarradid-lagasafn/2.0 (+https://github.com/MagnusKolsjo/mcp-for-althingi-stjornarradid-lagasafn)",
     "Accept":     "*/*",
 }
 

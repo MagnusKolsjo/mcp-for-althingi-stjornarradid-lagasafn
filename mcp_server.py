@@ -84,6 +84,27 @@ EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base"
 _embedding_modell = None
 _embedding_las    = threading.Lock()
 
+# PyTorchs MPS-backend är inte trådsäker: MetalShaderLibrary fyller sina
+# kärncacher utan lås första gången de används, så två samtidiga encode() från
+# arbetstrådarna kan korrumpera dem och krascha hela processen med SIGSEGV.
+# Låset gäller hela processen och inte en enskild modell, eftersom cacherna
+# delas av alla modeller på samma enhet.
+_encode_las = threading.Lock()
+
+
+class _SerialiseradModell:
+    """Omsluter en SentenceTransformer så att encode() alltid tar _encode_las."""
+
+    def __init__(self, modell) -> None:
+        self._modell = modell
+
+    def encode(self, *args, **kwargs):
+        with _encode_las:
+            return self._modell.encode(*args, **kwargs)
+
+    def __getattr__(self, namn):
+        return getattr(self._modell, namn)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -926,7 +947,7 @@ def _hamta_embedding_modell():
         try:
             os.dup2(log_fd, 1)
             from sentence_transformers import SentenceTransformer
-            _embedding_modell = SentenceTransformer(EMBEDDING_MODEL)
+            _embedding_modell = _SerialiseradModell(SentenceTransformer(EMBEDDING_MODEL))
         finally:
             os.dup2(save_fd1, 1)
             os.close(save_fd1)

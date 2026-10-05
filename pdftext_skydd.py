@@ -93,6 +93,19 @@ def _block_arbetare(sokvag: str, sidor: list[int], sprak: str, ko: mp.Queue) -> 
     os.dup2(tom, 1)
     os.dup2(tom, 2)
     os.close(tom)
+    # onnxruntime, som pymupdf4llm laddar för layout och OCR, skickar som
+    # standard användningsdata till Microsoft (mobile.events.data.microsoft.com).
+    # Inga data får lämna datorn till tredje part utan användarens samtycke, så
+    # telemetrin stängs av innan biblioteket laddas: miljövariabeln läses när
+    # onnxruntime startar, och anropet stänger av händelser även om biblioteket
+    # redan är laddat. Det tar också bort en krasch i telemetrins nedstängning
+    # när processen avslutas.
+    os.environ["ORT_DISABLE_TELEMETRY"] = "1"
+    try:
+        import onnxruntime
+        onnxruntime.disable_telemetry_events()
+    except ImportError:
+        pass
     try:
         import pymupdf  # noqa: F401  (laddar biblioteket i barnprocessen)
         import pymupdf4llm

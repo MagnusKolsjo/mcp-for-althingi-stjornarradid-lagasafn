@@ -11,6 +11,11 @@ tillämpar [Semantic Versioning](https://semver.org/).
 
 ### Fixat
 
+- onnxruntime, som `pymupdf4llm` laddar för layout och OCR, skickade som standard användningsdata
+  till Microsoft (`mobile.events.data.microsoft.com`) utan att användaren tillfrågats. Telemetrin
+  stängs nu av i PDF-extraktionens barnprocess (`ORT_DISABLE_TELEMETRY=1` och
+  `disable_telemetry_events()`) innan biblioteket laddas. Det tar också bort en krasch (SIGABRT)
+  i telemetrins nedstängning när barnprocessen avslutades.
 - Samtidiga sökanrop kunde krascha servern med SIGSEGV när embeddingmodellen kördes på
   Apple-GPU:n (MPS). PyTorchs MPS-backend fyller sina kärncacher utan lås första gången de
   används, och verktygen körs på parallella arbetstrådar. Alla `encode()`-anrop i processen

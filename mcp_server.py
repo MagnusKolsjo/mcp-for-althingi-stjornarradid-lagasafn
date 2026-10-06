@@ -180,7 +180,7 @@ def _las_vidare(verktyg: str, nyckel: str, varde: str, max_tecken: int,
 
 mcp = MCPServer(
     "island",
-    version="2.0.0",
+    version="2.0.1",
     cache_hints=CACHE_HINTAR,
     instructions=(
         "MCP-server för isländsk riksdags- och rättsdata. "
